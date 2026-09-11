@@ -7,3 +7,9 @@ pianobar
 libpiano.a
 libpiano.so*
 waitress-test
+
+# iOS (generated / build products — project is generated from ios/project.yml)
+.DS_Store
+ios/build/
+ios/Piano.xcodeproj/
+*.ipa

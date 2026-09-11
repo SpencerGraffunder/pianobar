@@ -189,6 +189,40 @@ Or install it to ``/usr/local`` by issuing::
 
 	gmake install
 
+iOS App (this fork)
+-------------------
+
+This fork contains an iOS port in ``ios/``. It reuses the unmodified
+C core (``src/libpiano``) together with small shims that replace the
+Linux-only dependencies (gcrypt → CommonCrypto Blowfish, libcurl →
+URLSession, json-c → JSONSerialization). The GUI is a deliberately
+simple single-screen SwiftUI app: no pictures, all controls on one
+screen, and a text field with the keyboard whenever the backend asks
+for input.
+
+Local development (macOS with Xcode + `xcodegen`_)::
+
+	cd ios
+	brew install xcodegen
+	xcodegen generate --spec project.yml
+	./build.sh                # quick simulator build (plain clang/swiftc)
+	xcodebuild -project Piano.xcodeproj -scheme PianoApp test \
+	    -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+	    CODE_SIGNING_ALLOWED=NO
+
+The Xcode project is *generated* from ``ios/project.yml`` (not
+committed). ``ios/Tests/PianoTests.m`` is the unit test suite covering
+the shims and the core list/response helpers; it runs on the
+simulator via the command above.
+
+CI (``.github/workflows/ios.yml``) runs the unit tests on a simulator
+and additionally produces an unsigned ``.ipa`` as a workflow artifact.
+An unsigned ``.ipa`` has to be (re-)signed with your own Apple
+credentials to install on a device, e.g. via Sideloadly, AltStore,
+or an ad-hoc provisioning profile.
+
+.. _xcodegen: https://github.com/yonaskolb/XcodeGen
+
 FAQ
 ---
 

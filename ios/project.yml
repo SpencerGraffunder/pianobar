@@ -1,0 +1,79 @@
+#
+# Xcode project specification (xcodegen 2.x).
+#
+# Generate with:
+#   xcodegen generate --spec ios/project.yml
+#
+# The app target compiles the UNMODIFIED pianobar C core (src/libpiano)
+# together with the iOS shims (ios/Shim) and a tiny glue layer
+# (ios/Glue). The test target reuses the same C sources so the unit
+# tests exercise the core + shims directly.
+#
+name: Piano
+options:
+  bundleIdPrefix: net.6xq
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    # C core + shim header locations (project lives in ios/, core in repo root)
+    HEADER_SEARCH_PATHS:
+      - $(SRCROOT)/../src
+      - $(SRCROOT)/../src/libpiano
+      - $(SRCROOT)/Shim
+      - $(SRCROOT)/Shim/avstubs
+      - $(SRCROOT)/Glue
+
+targets:
+  PianoApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: PianoApp
+        excludes:
+          - "Info.plist"
+      - path: ../src/libpiano
+      - path: Shim
+      - path: Glue
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.6xq.pianobar.ios
+        PRODUCT_NAME: PianoApp
+        INFOPLIST_FILE: PianoApp/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: PianoApp/PianoBridging.h
+        ENABLE_TESTABILITY: YES
+        CODE_SIGN_STYLE: Automatic
+        OTHER_LDFLAGS:
+          - -framework Security
+          - -framework AVFoundation
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+    scheme:
+      testTargets:
+        - PianoAppTests
+
+  PianoAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+        excludes:
+          - "Info.plist"
+      - path: ../src/libpiano
+      - path: Shim
+      - path: Glue
+    dependencies:
+      - target: PianoApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.6xq.pianobar.ios.tests
+        PRODUCT_NAME: PianoAppTests
+        INFOPLIST_FILE: Tests/Info.plist
+        OTHER_LDFLAGS:
+          - -framework Security
+          - -framework AVFoundation

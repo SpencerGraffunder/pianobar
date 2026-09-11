@@ -1,0 +1,86 @@
+#
+# iOS CI — build the pianobar iOS app (ios/) and produce an .ipa.
+#
+# Steps:
+#   1. Generate the Xcode project from ios/project.yml (xcodegen).
+#   2. Run the unit tests on an iOS simulator.
+#   3. Build a Release archive for a generic iOS device (code signing
+#      disabled — no Apple credentials needed).
+#   4. Assemble the .app into a (unsigned) .ipa and upload it as an
+#      artifact. An unsigned .ipa can be installed with any re-signing
+#      tool (Sideloadly, AltStore, TrollStore, ...) or with your own
+#      ad-hoc profile.
+#
+# To produce a *signed* .ipa instead, add the usual Apple secrets
+# (certificates / provisioning profile) and swap the export step for
+# `xcodebuild -exportArchive` with a matching ExportOptions.plist.
+#
+name: ios
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'ios/**'
+      - 'src/libpiano/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'src/libpiano/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -E 'iphonesimulator|iphoneos'
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Run unit tests (iOS simulator)
+        working-directory: ios
+        run: |
+          xcodebuild -project Piano.xcodeproj -scheme PianoApp \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath dd \
+            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO \
+            test
+
+      - name: Build Release for iOS device
+        run: |
+          xcodebuild -project ios/Piano.xcodeproj -scheme PianoApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath dd-device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="-" \
+            build
+
+      - name: Assemble .ipa
+        run: |
+          APP=$(find dd-device/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "Bundling $APP"
+          mkdir -p ipa-staging/Payload
+          cp -R "$APP" ipa-staging/Payload/
+          cd ipa-staging
+          zip -qry ../pianobar-ios.ipa Payload
+          cd ..
+          ls -lh pianobar-ios.ipa
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: pianobar-ios
+          path: pianobar-ios.ipa
