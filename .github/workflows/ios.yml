@@ -53,17 +53,11 @@ jobs:
       - name: Run unit tests (iOS simulator)
         working-directory: ios
         run: |
-          # xcodebuild test needs a *concrete* simulator; pick one that is
-          # available on this runner rather than hard-coding a name.
-          SIM=$(xcrun simctl list devices available --json | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-for devs in d["devices"].values():
-    for dev in devs:
-        if "iPhone" in dev["name"]:
-            print(dev["name"])
-            sys.exit()
-')
+          # xcodebuild test needs a *concrete* simulator; pick the first
+          # available iPhone on this runner rather than hard-coding a name.
+          SIM=$(xcrun simctl list devices available --json \
+                | jq -r '.devices[] | .[] | select(.name | contains("iPhone")) | .name' \
+                | head -1)
           echo "Using simulator: $SIM"
           xcodebuild -project Piano.xcodeproj -scheme PianoApp \
             -destination "platform=iOS Simulator,name=$SIM" \
