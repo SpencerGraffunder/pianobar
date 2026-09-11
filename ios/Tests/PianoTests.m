@@ -396,4 +396,52 @@
     XCTAssertEqual(d.type, PIANO_MUSICTYPE_ARTIST);
 }
 
+#pragma mark - Ownership stress
+
+/* Hammer the create/serialize/put cycle. This is the exact pattern the
+ * C core uses (request.c builds a login object, adds values, serializes,
+ * puts it). With a plain __bridge (no retain) the returned json_object*
+ * dangles and this crashes non-deterministically; with correct +1/-1
+ * ownership it is safe. Run under MallocScribble to make any freed-
+ * memory use explode. */
+- (void)testJsonOwnershipStress
+{
+    for (int i = 0; i < 5000; i++) {
+        json_object *j = json_object_new_object ();
+        json_object_object_add (j, "userAuthToken",
+                                json_object_new_string ("tok123"));
+        json_object_object_add (j, "syncTime",
+                                json_object_new_int (i));
+
+        const char *s = json_object_to_json_string (j);
+        XCTAssertTrue (s != NULL);
+        XCTAssertTrue (strstr (s, "tok123") != NULL);
+
+        json_object *v = NULL;
+        XCTAssertTrue (json_object_object_get_ex (j, "syncTime", &v));
+        XCTAssertEqual (json_object_get_int (v), i);
+
+        /* values added are owned by the container; put() only j */
+        json_object_put (j);
+    }
+
+    /* tokener_parse returns +1 (caller owns); values peeked must NOT be
+     * put. */
+    for (int i = 0; i < 2000; i++) {
+        json_object *p = json_tokener_parse ("{\"a\":1,\"b\":[1,2,3]}");
+        XCTAssertTrue (p != NULL);
+
+        json_object *a = NULL;
+        XCTAssertTrue (json_object_object_get_ex (p, "a", &a));
+        XCTAssertEqual (json_object_get_int (a), 1);
+
+        json_object *b = NULL;
+        XCTAssertTrue (json_object_object_get_ex (p, "b", &b));
+        json_object *two = json_object_array_get_idx (b, 1);
+        XCTAssertEqual (json_object_get_int (two), 2);
+
+        json_object_put (p); /* single put — balanced with the single +1 */
+    }
+}
+
 @end

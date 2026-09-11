@@ -11,12 +11,32 @@
 #include "json.h"
 
 /* json_object is an opaque pointer that actually holds an Objective-C
- * object pointer. */
+ * object pointer.
+ *
+ * Ownership (json-c semantics):
+ *  - "creating" calls (json_object_new_*, json_tokener_parse) return a
+ *    +1 reference owned by the C caller; json_object_put releases it.
+ *  - "peeking" calls (json_object_object_get_ex, json_object_array_get_idx,
+ *    json_object_object_get) return a reference owned by the CONTAINER;
+ *    the caller must NOT put it.
+ *
+ * A plain __bridge cast would NOT retain: the Objective-C temporary is
+ * released when the function returns and the json_object* dangles. That
+ * is only harmless if the memory happens not to be reused — in practice
+ * it crashes the process non-deterministically (seen on CI). */
 static inline id jobj (json_object *j) {
 	return (__bridge id) (void *) j;
 }
 
+/* +1: transfer ownership of a reference to the C world. */
 static inline json_object *jptr (id o) {
+	CFTypeRef cf = (__bridge_retained CFTypeRef) o;
+	return (json_object *) (void *) cf;
+}
+
+/* no ownership transfer: valid only while the container keeps the object
+ * alive. */
+static inline json_object *jpeek (id o) {
 	return (__bridge json_object *) o;
 }
 
@@ -53,6 +73,8 @@ int json_object_object_add (json_object *obj, const char *key,
 	NSMutableDictionary *m = jobj (obj);
 	if (key == NULL || ![m isKindOfClass: [NSMutableDictionary class]])
 		return -1;
+	/* the dictionary takes its own reference; the caller keeps its own
+	 * (json-c's object_add does not take ownership) */
 	m [[NSString stringWithUTF8String: key]] = jobj (val) ?: (id) [NSNull null];
 	return 0;
 }
@@ -89,7 +111,11 @@ const char *json_object_to_json_string (json_object *j) {
 }
 
 void json_object_put (json_object *j) {
-	(void) j; /* ARC manages lifetime */
+	if (j == NULL)
+		return;
+	/* jptr() did a +1; undo it. (plain cast: CFRelease takes CFTypeRef,
+	 * which is just const void *) */
+	CFRelease ((CFTypeRef) (void *) j);
 }
 
 json_object *json_tokener_parse (const char *str) {
@@ -116,7 +142,7 @@ bool json_object_object_get_ex (json_object *obj, const char *key,
 	if (v == nil)
 		return false;
 	if (val != NULL)
-		*val = jptr (v);
+		*val = jpeek (v); /* container owns it — do NOT put() */
 	return true;
 }
 
@@ -124,8 +150,17 @@ const char *json_object_get_string (json_object *j) {
 	id o = jobj (j);
 	if ([o isKindOfClass: [NSString class]])
 		return [(NSString *) o UTF8String];
-	if ([o isKindOfClass: [NSNumber class]])
-		return [(NSNumber *) o stringValue].UTF8String;
+	if ([o isKindOfClass: [NSNumber class]]) {
+		/* stringValue creates a temporary NSString whose internal buffer
+		 * we must not hand out; copy to stable thread-local storage */
+		static __thread char buf [256];
+		const char *s = [(NSNumber *) o stringValue].UTF8String;
+		if (s == NULL)
+			return NULL;
+		strncpy (buf, s, sizeof (buf) - 1);
+		buf [sizeof (buf) - 1] = '\0';
+		return buf;
+	}
 	return NULL;
 }
 
@@ -188,5 +223,5 @@ json_object *json_object_array_get_idx (json_object *arr, size_t idx) {
 	NSArray *na = (NSArray *) a;
 	if (idx >= (size_t) na.count)
 		return NULL;
-	return jptr (na[idx]);
+	return jpeek (na[idx]); /* container owns it — do NOT put() */
 }
