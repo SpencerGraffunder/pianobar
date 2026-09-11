@@ -32,6 +32,10 @@ on:
       - '.github/workflows/ios.yml'
   workflow_dispatch:
 
+# Needed to publish the .ipa as a release asset (rolling 'ios-latest').
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -87,6 +91,8 @@ jobs:
           ls -lh pianobar-ios.ipa
 
       - name: Publish .ipa as GitHub Release (bare file, no zip)
+        # PR runs (esp. from forks) get a read-only token; publish only on push/dispatch.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

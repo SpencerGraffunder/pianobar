@@ -212,14 +212,18 @@ Local development (macOS with Xcode + `xcodegen`_)::
 
 The Xcode project is *generated* from ``ios/project.yml`` (not
 committed). ``ios/Tests/PianoTests.m`` is the unit test suite covering
-the shims and the core list/response helpers; it runs on the
-simulator via the command above.
+the shims and the core list/response helpers, and
+``ios/Tests/PianoNetworkTests.swift`` adds a live login test that
+exercises the real ``PianoClient`` -> C core -> URLSession path
+(skipped automatically if the runner cannot reach pandora.com);
+both run on the simulator via the command above.
 
 CI (``.github/workflows/ios.yml``) runs the unit tests on a simulator
-and additionally produces an unsigned ``.ipa`` as a workflow artifact.
-An unsigned ``.ipa`` has to be (re-)signed with your own Apple
-credentials to install on a device, e.g. via Sideloadly, AltStore,
-or an ad-hoc provisioning profile.
+and additionally produces an unsigned ``.ipa`` published as a GitHub
+*release* asset (``ios-latest``) — i.e. it downloads as the bare
+``.ipa`` file rather than a zip. An unsigned ``.ipa`` has to be
+(re-)signed with your own Apple credentials to install on a device,
+e.g. via Sideloadly, AltStore, or an ad-hoc provisioning profile.
 
 .. _xcodegen: https://github.com/yonaskolb/XcodeGen
 
