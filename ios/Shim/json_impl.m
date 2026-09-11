@@ -6,6 +6,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "json.h"
@@ -62,6 +63,10 @@ json_object *json_object_new_boolean (int b) {
 
 json_object *json_object_new_int (int i) {
 	return jptr (@(i));
+}
+
+json_object *json_object_new_null (void) {
+	return jptr ([NSNull null]);
 }
 
 json_object *json_object_new_double (double d) {
@@ -151,10 +156,15 @@ const char *json_object_get_string (json_object *j) {
 	if ([o isKindOfClass: [NSString class]])
 		return [(NSString *) o UTF8String];
 	if ([o isKindOfClass: [NSNumber class]]) {
+		NSNumber *n = (NSNumber *) o;
+		const char *t = [n objCType]; /* returns C string */
+		if (t != NULL && (t[0] == 'c' || t[0] == 'C'))
+			/* real json-c renders booleans as "true"/"false" */
+			return [n boolValue] ? "true" : "false";
 		/* stringValue creates a temporary NSString whose internal buffer
 		 * we must not hand out; copy to stable thread-local storage */
 		static __thread char buf [256];
-		const char *s = [(NSNumber *) o stringValue].UTF8String;
+		const char *s = [n stringValue].UTF8String;
 		if (s == NULL)
 			return NULL;
 		strncpy (buf, s, sizeof (buf) - 1);
@@ -175,6 +185,11 @@ int json_object_get_int (json_object *j) {
 	id o = jobj (j);
 	if ([o isKindOfClass: [NSNumber class]])
 		return [(NSNumber *) o intValue];
+	/* real json-c parses numeric strings: get_int("42") == 42. Pandora
+	 * returns some numeric fields as strings (e.g. "partnerId":"42");
+	 * the pianobar core relies on this (ph->partner.id). */
+	if ([o isKindOfClass: [NSString class]])
+		return (int) strtoll (((NSString *) o).UTF8String, NULL, 0);
 	return 0;
 }
 
@@ -182,6 +197,8 @@ double json_object_get_double (json_object *j) {
 	id o = jobj (j);
 	if ([o isKindOfClass: [NSNumber class]])
 		return [(NSNumber *) o doubleValue];
+	if ([o isKindOfClass: [NSString class]])
+		return strtod (((NSString *) o).UTF8String, NULL);
 	return 0.0;
 }
 

@@ -43,6 +43,7 @@ json_object *json_object_new_array (void);
 json_object *json_object_new_string (const char *s);
 json_object *json_object_new_boolean (int b);
 json_object *json_object_new_int (int i);
+json_object *json_object_new_null (void);
 json_object *json_object_new_double (double d);
 
 /* mutators (return 0 on success, -1 on error) */

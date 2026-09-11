@@ -196,6 +196,80 @@
     XCTAssertTrue(json_object_is_type(s, json_type_string));
 }
 
+/*
+ * Real json-c semantics the pianobar core relies on (verified against
+ * json-c 0.13+): numeric getters parse numeric STRINGS, and booleans
+ * render as "true"/"false". Pandora returns numeric fields as strings
+ * (e.g. "partnerId":"42"); the core does
+ * `ph->partner.id = json_object_get_int(partnerId)` and the userLogin
+ * URL embeds `partner_id=%i` — a 0 there makes Pandora answer
+ * {"stat":"fail","code":0} → "Internal error". Regression tests for
+ * the shim that broke these.
+ */
+- (void)testJsonGetIntParsesNumericStrings
+{
+    json_object *s42 = json_object_new_string("42");
+    XCTAssertEqual(json_object_get_int(s42), 42);
+
+    json_object *sBig = json_object_new_string("1695024441000");
+    XCTAssertEqual(json_object_get_int(sBig), (int) 1695024441000L);
+
+    json_object *sFloat = json_object_new_string("42.7");
+    XCTAssertEqual(json_object_get_int(sFloat), 42);
+
+    json_object *sJunk = json_object_new_string("abc");
+    XCTAssertEqual(json_object_get_int(sJunk), 0);
+
+    /* NULL-ish / non-numeric still safe */
+    json_object *nullObj = json_object_new_null();
+    XCTAssertEqual(json_object_get_int(nullObj), 0);
+}
+
+- (void)testJsonGetDoubleParsesNumericStrings
+{
+    json_object *s = json_object_new_string("42.75");
+    XCTAssertTrue(fabs(json_object_get_double(s) - 42.75) < 0.0001);
+
+    json_object *sInt = json_object_new_string("7");
+    XCTAssertTrue(fabs(json_object_get_double(sInt) - 7.0) < 0.0001);
+
+    json_object *sJunk = json_object_new_string("nope");
+    XCTAssertEqual(json_object_get_double(sJunk), 0.0);
+}
+
+- (void)testJsonGetStringOnBoolean
+{
+    json_object *t = json_object_new_boolean(1);
+    XCTAssertEqualObjects([NSString stringWithUTF8String:json_object_get_string(t)],
+                          @"true");
+    json_object *f = json_object_new_boolean(0);
+    XCTAssertEqualObjects([NSString stringWithUTF8String:json_object_get_string(f)],
+                          @"false");
+}
+
+/* Shape of a real Pandora partnerLogin (step 0) response: numeric fields
+ * arrive as strings. */
+- (void)testJsonParsePandoraPartnerLoginResponse
+{
+    const char *json =
+        "{\"stat\":\"ok\",\"result\":{\"stationSkipLimit\":6,"
+        "\"partnerId\":\"42\",\"partnerAuthToken\":\"VAyOF96RBRvkcwB9/d3AQLfg==\","
+        "\"urls\":{\"autoComplete\":\"http://autocomplete-sc.pandora.com/search\"},"
+        "\"syncTime\":\"8062f143853f7f7237cf73d92ef72078\","
+        "\"stationSkipUnit\":\"hour\"}}";
+
+    json_object *j = json_tokener_parse(json);
+    XCTAssertTrue(j != NULL);
+    json_object *result = NULL;
+    XCTAssertTrue(json_object_object_get_ex(j, "result", &result));
+    json_object *pid = NULL;
+    XCTAssertTrue(json_object_object_get_ex(result, "partnerId", &pid));
+    /* This is the exact core call that used to yield 0. */
+    XCTAssertEqual(json_object_get_int(pid), 42);
+
+    json_object_put(j);
+}
+
 - (void)testJsonArray
 {
     json_object *arr = json_object_new_array();
