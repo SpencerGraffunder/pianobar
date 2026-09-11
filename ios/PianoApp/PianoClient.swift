@@ -132,9 +132,14 @@ final class PianoClient {
     private var currentPlaylist: UnsafeMutablePointer<PianoSong>?
 
     /// Defaults from src/settings.c (the "android" partner).
+    ///
+    /// `device` MUST be "android-generic" (pianobar's default, settings.c).
+    /// Pandora's backend returns HTTP 504 ("upstream request timeout") for
+    /// partnerLogin when deviceModel is the bare "android" — verified
+    /// deterministically against tuner.pandora.com.
     private static let partnerUser = "android"
     private static let partnerPassword = "AC7IBG09A3DTSYM4R41UJWL07VLN8JI7"
-    private static let device = "android"
+    private static let device = "android-generic"
     private static let inkey = "R=U!LH$O2B#"
     private static let outkey = "6#26FRL$ZWD"
     private static let rpcHost = "tuner.pandora.com"

@@ -224,6 +224,7 @@ struct ContentView: View {
             TextField("username", text: $model.username)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
+                .autocapitalization(.none)
                 .focused($focus, equals: .username)
             SecureField("password", text: $model.password)
                 .textFieldStyle(.roundedBorder)
