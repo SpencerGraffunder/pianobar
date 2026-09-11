@@ -6,10 +6,11 @@
 #   2. Run the unit tests on an iOS simulator.
 #   3. Build a Release archive for a generic iOS device (code signing
 #      disabled — no Apple credentials needed).
-#   4. Assemble the .app into a (unsigned) .ipa and upload it as an
-#      artifact. An unsigned .ipa can be installed with any re-signing
-#      tool (Sideloadly, AltStore, TrollStore, ...) or with your own
-#      ad-hoc profile.
+#   4. Assemble the .app into a (unsigned) .ipa and publish it as a
+#      GitHub RELEASE asset — downloads are a bare .ipa file (Actions
+#      artifacts are always wrapped in a .zip). An unsigned .ipa can be
+#      installed with any re-signing tool (Sideloadly, AltStore,
+#      TrollStore, ...) or with your own ad-hoc profile.
 #
 # To produce a *signed* .ipa instead, add the usual Apple secrets
 # (certificates / provisioning profile) and swap the export step for
@@ -85,8 +86,19 @@ jobs:
           cd ..
           ls -lh pianobar-ios.ipa
 
-      - name: Upload .ipa
-        uses: actions/upload-artifact@v4
-        with:
-          name: pianobar-ios
-          path: pianobar-ios.ipa
+      - name: Publish .ipa as GitHub Release (bare file, no zip)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Rolling release: always holds the newest CI build. Release
+          # assets download as the bare .ipa (Actions artifacts are always
+          # zipped, which is why we don't use them for the .ipa).
+          TAG=ios-latest
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" pianobar-ios.ipa --clobber
+          else
+            gh release create "$TAG" pianobar-ios.ipa \
+              --title "iOS build (latest CI)" \
+              --notes "Unsigned .ipa from CI. Re-sign with Sideloadly / AltStore / an ad-hoc profile to install."
+          fi
+          gh release view "$TAG"
