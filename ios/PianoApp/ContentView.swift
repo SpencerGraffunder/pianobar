@@ -64,6 +64,15 @@ final class AppModel: ObservableObject {
         playerCancellable = player.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        // Restore saved credentials and log in automatically, so the user
+        // doesn't have to re-enter them on every launch. (If the login
+        // fails — bad password, no network — the error shows in the status
+        // line and the login screen stays up.)
+        if let saved = Keychain.load() {
+            username = saved.username
+            password = saved.password
+            login()
+        }
     }
 
     // MARK: Derived state
@@ -116,6 +125,8 @@ final class AppModel: ObservableObject {
             guard let client = self.client else { return }
             try await client.login()
             self.loggedIn = true
+            // Remember the credentials for next time.
+            Keychain.save(username: self.username, password: self.password)
             try await client.getStations()
             self.stations = client.stations()
             if self.selectedStationID == nil, let first = self.stations.first {
@@ -151,6 +162,11 @@ final class AppModel: ObservableObject {
         searchResult = nil
         selectedStationID = nil
         player.stop()
+        // Forget the saved credentials so the next launch shows the login
+        // screen. (Re-login stores the new credentials again.) Keep the
+        // username for convenience; clear the password.
+        Keychain.delete()
+        password = ""
         status = "Logged out."
     }
 
@@ -183,6 +199,10 @@ final class AppModel: ObservableObject {
             player.pause()
         } else if let url = currentSong?.audioUrl, let u = URL(string: url) {
             player.play(url: u)
+        } else {
+            // No playable song yet (empty queue, or the current song has no
+            // audio URL) — fetch the next song from the station and start it.
+            nextSong()
         }
     }
 
