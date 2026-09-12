@@ -35,7 +35,7 @@ final class KeychainTests: XCTestCase {
     }()
 
     override func setUpWithError() throws {
-        try super.setUp()
+        super.setUp()
         switch Self.keychainState {
         case "usable":
             break
