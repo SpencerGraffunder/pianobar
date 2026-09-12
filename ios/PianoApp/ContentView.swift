@@ -1,7 +1,9 @@
 //
 // ContentView.swift — one-screen, button-first pianobar UI.
-// No artwork, no fancy layout: stations, next song, love/ban/tired,
-// search, create station. All on one screen.
+// No artwork, no fancy layout. Everything is a big button on one screen:
+// transport, ratings, song info, station management, quick mix, volume,
+// and search. When an action needs text input (add seed / rename), a text
+// box appears (alert + keyboard).
 //
 // Copyright (c) 2025 Spencer Graffunder
 // MIT licensed.
@@ -22,13 +24,34 @@ final class AppModel: ObservableObject {
     // data
     @Published var stations: [Station] = []
     @Published var selectedStationID: String?
-    @Published var currentSong: Song?
+    /// Full playlist from the last getPlaylist (song[0] is current, the
+    /// rest are upcoming). The C structs are owned by the core and stay
+    /// valid until the next getPlaylist call, so the whole array is
+    /// replaced together — never keep a Song across a getPlaylist.
+    @Published var playlist: [Song] = []
     @Published var searchText = ""
     @Published var searchResult: SearchResult?
+
+    // Love toggle state (per-song, session-scoped). Pandora has no query for
+    // "is this song loved", so we track which songs the user has loved here.
+    @Published var lovedSongIDs: Set<String> = []
+    // "Add Music" search sheet (search box is no longer always visible).
+    @Published var showAddSearch = false
 
     // ui
     @Published var status = "Enter your Pandora account to begin."
     @Published var isWorking = false
+    @Published var showUpcoming = false
+
+    // text-input prompts
+    @Published var prompt: Prompt?
+
+    enum Prompt: Identifiable {
+        case rename
+        var id: Self { self }
+    }
+    @Published var promptText = ""
+    @Published var confirmDelete = false
 
     // playback (forward Player's changes to our own objectWillChange)
     @Published private(set) var player = Player()
@@ -43,14 +66,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Derived state
+
     var selectedStation: Station? {
         guard let id = selectedStationID else { return nil }
         return stations.first { $0.stableId == id }
     }
 
+    var currentSong: Song? { playlist.first }
+
+    var upcoming: [Song] { Array(playlist.dropFirst()) }
+
+    /// Whether the currently-playing song has been loved (toggle state).
+    var isCurrentLoved: Bool {
+        guard let s = currentSong else { return false }
+        return lovedSongIDs.contains(s.id)
+    }
+
     // MARK: - Actions (each runs one C-core exchange; state stays on main)
 
-    private func run(_ label: String, _ work: @escaping () async throws -> Void) {
+    private func run(_ label: String,
+                     _ work: @escaping () async throws -> Void) {
         guard !working else { return }
         working = true
         isWorking = true
@@ -67,6 +103,8 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Auth
+
     func login() {
         guard !username.isEmpty, !password.isEmpty else { return }
         run("Logging in") { [weak self] in
@@ -79,11 +117,11 @@ final class AppModel: ObservableObject {
             try await client.login()
             self.loggedIn = true
             try await client.getStations()
-            let list = client.stations()
-            self.stations = list
-            if self.selectedStationID == nil, let first = list.first {
+            self.stations = client.stations()
+            if self.selectedStationID == nil, let first = self.stations.first {
                 self.selectedStationID = first.stableId
             }
+            self.status = "Logged in. \(self.stations.count) station(s)."
         }
     }
 
@@ -92,17 +130,37 @@ final class AppModel: ObservableObject {
         run("Loading stations") { [weak self] in
             guard let self else { return }
             try await client.getStations()
-            let list = client.stations()
-            self.stations = list
-            if self.selectedStationID == nil, let first = list.first {
+            self.stations = client.stations()
+            // Re-point selection if the current one vanished.
+            if let id = self.selectedStationID,
+               !self.stations.contains(where: { $0.stableId == id }) {
+                self.selectedStationID = self.stations.first?.stableId
+            } else if self.selectedStationID == nil,
+                let first = self.stations.first {
                 self.selectedStationID = first.stableId
             }
         }
     }
 
-    private func playIfAvailable(_ songs: [Song]) {
-        if let url = songs.first?.audioUrl, let u = URL(string: url) {
+    func logout() {
+        // The C core has no explicit logout; drop our session.
+        client = nil
+        loggedIn = false
+        stations = []
+        playlist = []
+        searchResult = nil
+        selectedStationID = nil
+        player.stop()
+        status = "Logged out."
+    }
+
+    // MARK: Transport
+
+    private func playIfAvailable() {
+        if let url = currentSong?.audioUrl, let u = URL(string: url) {
             player.play(url: u)
+        } else if currentSong != nil {
+            status = "This song has no audio URL."
         }
     }
 
@@ -114,35 +172,9 @@ final class AppModel: ObservableObject {
         run("Next song") { [weak self] in
             guard let self else { return }
             let songs = try await client.getPlaylist(station: station)
-            self.currentSong = songs.first
-            self.playIfAvailable(songs)
-        }
-    }
-
-    func rate(_ rating: PianoSongRating_t, label: String) {
-        guard let client = client, let song = currentSong else { return }
-        run(label) { [weak self] in
-            guard let self else { return }
-            try await client.rateSong(song, rating: rating)
-            // After rating, advance to the next song (ui.c does this).
-            if let station = self.selectedStation {
-                let songs = try await client.getPlaylist(station: station)
-                self.currentSong = songs.first
-                self.playIfAvailable(songs)
-            }
-        }
-    }
-
-    func markTired() {
-        guard let client = client, let song = currentSong else { return }
-        run("Tired") { [weak self] in
-            guard let self else { return }
-            try await client.markTired(song)
-            if let station = self.selectedStation {
-                let songs = try await client.getPlaylist(station: station)
-                self.currentSong = songs.first
-                self.playIfAvailable(songs)
-            }
+            self.playlist = songs
+            self.showUpcoming = false
+            self.playIfAvailable()
         }
     }
 
@@ -154,6 +186,182 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func stopPlayback() {
+        player.stop()
+        status = "Stopped."
+    }
+
+    // MARK: Rating
+
+    private func advanceAfterRating() async throws {
+        guard let client = client, let station = selectedStation else { return }
+        let songs = try await client.getPlaylist(station: station)
+        playlist = songs
+        showUpcoming = false
+        playIfAvailable()
+    }
+
+    func rate(_ rating: PianoSongRating_t, label: String) {
+        guard let client = client, let song = currentSong else {
+            status = "Play a song first."
+            return
+        }
+        run(label) { [weak self] in
+            guard let self else { return }
+            try await client.rateSong(song, rating: rating)
+            try await self.advanceAfterRating()
+        }
+    }
+
+    /// Love is a toggle on the current song (it does NOT skip):
+    ///  - first press: registers the love with Pandora + colors the heart
+    ///  - second press on the same song: un-colors it (clears local state).
+    /// Pandora has no "un-love" API, so the second press only clears state.
+    func toggleLove() {
+        guard let song = currentSong else {
+            status = "Play a song first."
+            return
+        }
+        if lovedSongIDs.contains(song.id) {
+            lovedSongIDs.remove(song.id)
+            status = "Un-loved."
+        } else {
+            lovedSongIDs.insert(song.id)
+            guard let client = client else { status = "Loved."; return }
+            let c = client
+            run("Loving") {
+                try await c.rateSong(song, rating: PIANO_RATE_LOVE)
+            }
+        }
+    }
+
+    func markTired() {
+        guard let client = client, let song = currentSong else {
+            status = "Play a song first."
+            return
+        }
+        run("Tired") { [weak self] in
+            guard let self else { return }
+            try await client.markTired(song)
+            try await self.advanceAfterRating()
+        }
+    }
+
+    // MARK: Song info
+
+    func explainSong() {
+        guard let client = client, let song = currentSong else {
+            status = "Play a song first."
+            return
+        }
+        run("Explaining") { [weak self] in
+            guard let self else { return }
+            let why = try await client.explain(song)
+            self.status = why.isEmpty
+                ? "No explanation available for this song."
+                : why
+        }
+    }
+
+    func bookmarkSong() {
+        guard let client = client, let song = currentSong else {
+            status = "Play a song first."
+            return
+        }
+        run("Bookmarking") { [weak self] in
+            guard let self else { return }
+            try await client.bookmark(song)
+            self.status = "Bookmarked."
+        }
+    }
+
+    func toggleUpcoming() {
+        showUpcoming.toggle()
+    }
+
+    // MARK: Station management
+
+    func startRename() {
+        guard let station = selectedStation else {
+            status = "Pick a station first."
+            return
+        }
+        promptText = station.name ?? ""
+        prompt = .rename
+    }
+
+    func confirmRename() {
+        guard let client = client, let station = selectedStation else { return }
+        let name = promptText.trimmingCharacters(in: .whitespaces)
+        prompt = nil
+        guard !name.isEmpty else { return }
+        run("Renaming") { [weak self] in
+            guard let self else { return }
+            try await client.renameStation(station, newName: name)
+            // The core updated the name in place; refresh the list copy.
+            self.stations = client.stations()
+            self.status = "Station renamed."
+        }
+    }
+
+    func deleteStation() {
+        guard let client = client, let station = selectedStation else { return }
+        run("Deleting") { [weak self] in
+            guard let self else { return }
+            try await client.deleteStation(station)
+            // The core freed the station and removed it from the list.
+            self.stations = client.stations()
+            self.selectedStationID = self.stations.first?.stableId
+            self.playlist = []
+            self.player.stop()
+            self.status = "Station deleted."
+        }
+    }
+
+    // MARK: Quick mix
+
+    func toggleQuickMix() {
+        guard let client = client, let station = selectedStation else {
+            status = "Pick a station first."
+            return
+        }
+        guard station.isQuickMix else {
+            status = "The current station is not a QuickMix station."
+            return
+        }
+        // On/off: if any station is currently included, turn all off, else
+        // include every non-quickmix station.
+        let anyOn = stations.contains { $0.useQuickMix }
+        let include: Int8 = anyOn ? 0 : 1
+        run("Quick Mix") { [weak self] in
+            guard let self else { return }
+            for s in self.stations where !s.isQuickMix {
+                s.raw.pointee.useQuickMix = include
+            }
+            try await client.setQuickMix()
+            self.status = anyOn ? "QuickMix stations cleared."
+                : "QuickMix includes all stations."
+            // Pick up the new mix.
+            if let st = self.selectedStation {
+                let songs = try await client.getPlaylist(station: st)
+                self.playlist = songs
+                self.showUpcoming = false
+                self.playIfAvailable()
+            }
+        }
+    }
+
+    // MARK: Volume
+
+    func volumeDown() { player.nudgeVolume(-0.1) }
+    func volumeUp()   { player.nudgeVolume(+0.1) }
+    func volumeReset() {
+        player.resetVolume()
+        status = "Volume reset."
+    }
+
+    // MARK: Search
+
     func doSearch() {
         guard let client = client, !searchText.isEmpty else { return }
         run("Searching") { [weak self] in
@@ -162,36 +370,51 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func makeStation(token: String, name: String, fromArtist: Bool) {
-        guard let client = client, !token.isEmpty else { return }
+    private func makeStation(musicToken: String, name: String) {
+        guard let client = client, !musicToken.isEmpty else { return }
         run("Making station for \(name)") { [weak self] in
             guard let self else { return }
-            try await client.createStation(token: token, fromArtist: fromArtist)
+            try await client.createStation(musicToken: musicToken)
             try await client.getStations()
             self.stations = client.stations()
+            if let newStation = self.stations.last {
+                self.selectedStationID = newStation.stableId
+            }
             self.searchResult = nil
+            self.status = "Station \"\(name)\" created."
         }
     }
 
     func makeStationFromArtist(_ artist: SearchArtist) {
-        makeStation(token: artist.musicId, name: artist.name, fromArtist: true)
+        makeStation(musicToken: artist.musicId, name: artist.name)
     }
 
     func makeStationFromSong(_ song: SearchSong) {
-        makeStation(token: song.musicId, name: song.title, fromArtist: false)
+        makeStation(musicToken: song.musicId, name: song.title)
     }
 
-    func logout() {
-        // The C core has no explicit logout; drop our session.
-        client = nil
-        loggedIn = false
-        stations = []
-        currentSong = nil
-        searchResult = nil
-        selectedStationID = nil
-        player.stop()
-        status = "Logged out."
+    /// Add a search result to the current station as a seed (driven by the
+    /// "Add Music" sheet). Results carry a musicId usable as a seed directly.
+    func addSeedFromMusicId(_ musicId: String) {
+        guard let client = client, let station = selectedStation,
+              !musicId.isEmpty else { return }
+        let c = client
+        run("Adding music") {
+            try await c.addSeed(to: station, musicId: musicId)
+        }
     }
+}
+
+// MARK: - Control button descriptor
+
+private struct Control: Identifiable {
+    enum Role { case normal, prominent, destructive, loved }
+    let id: String
+    let title: String
+    let systemImage: String
+    let role: Role
+    let enabled: Bool
+    let action: () -> Void
 }
 
 // MARK: - View
@@ -200,7 +423,13 @@ struct ContentView: View {
     @StateObject private var model = AppModel()
     @FocusState private var focus: Field?
 
-    private enum Field { case username, password, search }
+    private enum Field { case username, password }
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+    ]
 
     var body: some View {
         NavigationStack {
@@ -211,16 +440,50 @@ struct ContentView: View {
                     mainView
                 }
             }
-            .padding()
+            .padding(.horizontal)
             .navigationTitle("pianobar")
+            .navigationBarTitleDisplayMode(.inline)
         }
         .interactiveDismissDisabled()
+        // Rename prompt — opens keyboard + text box.
+        .alert(
+            "Rename station",
+            isPresented: promptBinding
+        ) {
+            TextField(
+                "new station name",
+                text: $model.promptText
+            )
+            .autocorrectionDisabled()
+            .autocapitalization(.none)
+            Button("Cancel", role: .cancel) { model.prompt = nil }
+            Button("OK") { model.confirmRename() }
+                .disabled(model.promptText.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        .confirmationDialog(
+            "Delete this station?",
+            isPresented: $model.confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete station") {
+                model.deleteStation()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+
+    private var promptBinding: Binding<Bool> {
+        Binding(
+            get: { model.prompt != nil },
+            set: { if !$0 { model.prompt = nil } }
+        )
     }
 
     // MARK: Login
 
     private var loginView: some View {
         VStack(spacing: 14) {
+            Spacer()
             TextField("username", text: $model.username)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
@@ -233,10 +496,13 @@ struct ContentView: View {
                 .onSubmit { model.login() }
             Button("Log in", action: model.login)
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(model.isWorking || model.username.isEmpty)
             Text(model.status)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer()
         }
     }
 
@@ -244,142 +510,293 @@ struct ContentView: View {
 
     private var mainView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // Station picker + refresh
-                HStack {
-                    Picker("Station", selection: $model.selectedStationID) {
-                        Text("—").tag(String?.none)
-                        ForEach(model.stations) { s in
-                            Text(s.name ?? s.stableId).tag(Optional(s.stableId))
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    Button {
-                        model.refreshStations()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.borderless)
+            VStack(alignment: .leading, spacing: 14) {
+                stationBar
+                currentSongCard
+                controlGrid
+                if model.showUpcoming {
+                    upcomingList
                 }
-
-                // Current song
-                if let song = model.currentSong {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(song.title ?? "(untitled)")
-                            .font(.headline)
-                        Text(song.artist ?? "")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        if let album = song.album {
-                            Text(album)
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(Color(.secondarySystemBackground),
-                                in: RoundedRectangle(cornerRadius: 10))
-                } else {
-                    Text("No song yet — tap Next.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
-                // Transport row
-                HStack(spacing: 10) {
-                    Button("Next") { model.nextSong() }
-                        .buttonStyle(.borderedProminent)
-                    Button(model.player.isPlaying ? "Pause" : "Play") {
-                        model.togglePlayback()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(model.currentSong == nil)
-                    Button("Love") { model.rate(PIANO_RATE_LOVE, label: "Loving") }
-                        .buttonStyle(.bordered)
-                        .disabled(model.currentSong == nil)
-                    Button("Ban") { model.rate(PIANO_RATE_BAN, label: "Banning") }
-                        .buttonStyle(.bordered)
-                        .tint(.red)
-                        .disabled(model.currentSong == nil)
-                    Button("Tired") { model.markTired() }
-                        .buttonStyle(.bordered)
-                        .disabled(model.currentSong == nil)
-                }
-
-                Divider()
-
-                // Search
-                TextField("search artists or songs", text: $model.searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-                    .focused($focus, equals: .search)
-                    .submitLabel(.search)
-                    .onSubmit { model.doSearch() }
-                Button("Search") { model.doSearch() }
-                    .buttonStyle(.bordered)
-                    .disabled(model.searchText.isEmpty)
-
-                if let result = model.searchResult {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if !result.artists.isEmpty {
-                            Text("Artists")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            ForEach(result.artists) { a in
-                                Button {
-                                    model.makeStationFromArtist(a)
-                                } label: {
-                                    Text(a.name)
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                        if !result.songs.isEmpty {
-                            Text("Songs")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            ForEach(result.songs) { s in
-                                Button {
-                                    model.makeStationFromSong(s)
-                                } label: {
-                                    Text("\(s.title) — \(s.artist)")
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                        if result.isEmpty {
-                            Text("No results.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Text(model.status)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                statusText
             }
-            .padding(.bottom, 40)
+            .padding(.vertical, 8)
+            .padding(.bottom, 32)
+        }
+        .sheet(isPresented: $model.showAddSearch) {
+            AddMusicSheet(model: model)
         }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    model.refreshStations()
-                } label: {
+                Button { model.refreshStations() } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                Button {
-                    model.logout()
-                } label: {
+                Button { model.logout() } label: {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
                 }
             }
         }
-        .disabled(model.isWorking)
         .onAppear {
             if !model.loggedIn { focus = .username }
+        }
+    }
+
+    private var stationBar: some View {
+        HStack {
+            Picker("Station", selection: $model.selectedStationID) {
+                Text("—").tag(String?.none)
+                ForEach(model.stations) { s in
+                    Text(s.name ?? s.stableId).tag(Optional(s.stableId))
+                }
+            }
+            .pickerStyle(.menu)
+        }
+    }
+
+    @ViewBuilder
+    private var currentSongCard: some View {
+        if let song = model.currentSong {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(song.title ?? "(untitled)").font(.headline)
+                Text(song.artist ?? "").font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if let album = song.album {
+                    Text(album).font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 10))
+        } else {
+            Text("No song yet — tap Next.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var controlGrid: some View {
+        let hasSong = model.currentSong != nil
+        let hasStation = model.selectedStation != nil
+        let hasUpcoming = model.upcoming.count > 0
+        let controls: [Control] = [
+            .init(id: "playpause", title: model.player.isPlaying ? "Pause" : "Play",
+                  systemImage: model.player.isPlaying ? "pause.fill" : "play.fill",
+                  role: .prominent, enabled: !model.player.isPlaying || hasSong,
+                  action: model.togglePlayback),
+            .init(id: "next", title: "Next", systemImage: "forward.fill",
+                  role: .normal, enabled: hasStation, action: model.nextSong),
+            .init(id: "stop", title: "Stop", systemImage: "stop.fill",
+                  role: .normal, enabled: model.player.isPlaying,
+                  action: model.stopPlayback),
+            .init(id: "upcoming", title: "Upcoming", systemImage: "list.bullet",
+                  role: .normal, enabled: hasUpcoming,
+                  action: model.toggleUpcoming),
+            .init(id: "love", title: model.isCurrentLoved ? "Loved" : "Love",
+                  systemImage: "heart.fill",
+                  role: model.isCurrentLoved ? .loved : .normal,
+                  enabled: hasSong,
+                  action: model.toggleLove),
+            .init(id: "ban", title: "Ban", systemImage: "nosign",
+                  role: .normal, enabled: hasSong,
+                  action: { model.rate(PIANO_RATE_BAN, label: "Banning") }),
+            .init(id: "tired", title: "Tired", systemImage: "zzz",
+                  role: .normal, enabled: hasSong,
+                  action: model.markTired),
+            .init(id: "explain", title: "Explain", systemImage: "questionmark.circle",
+                  role: .normal, enabled: hasSong, action: model.explainSong),
+            .init(id: "bookmark", title: "Bookmark", systemImage: "bookmark.fill",
+                  role: .normal, enabled: hasSong, action: model.bookmarkSong),
+            .init(id: "addseed", title: "Add Music", systemImage: "plus.circle",
+                  role: .normal, enabled: hasStation,
+                  action: { model.showAddSearch = true }),
+            .init(id: "rename", title: "Rename", systemImage: "pencil",
+                  role: .normal, enabled: hasStation, action: model.startRename),
+            .init(id: "delete", title: "Delete", systemImage: "trash",
+                  role: .normal, enabled: hasStation,
+                  action: { model.confirmDelete = true }),
+            .init(id: "quickmix", title: "Quick Mix", systemImage: "shuffle",
+                  role: .normal, enabled: hasStation, action: model.toggleQuickMix),
+        ]
+
+        return LazyVGrid(columns: columns, spacing: 10) {
+            ForEach(controls) { c in
+                Button(action: c.action) {
+                    VStack(spacing: 6) {
+                        Image(systemName: c.systemImage)
+                            .font(.system(size: 20, weight: .semibold))
+                        Text(c.title)
+                            .font(.subheadline.weight(.medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 62)
+                }
+                .buttonStyle(GridButtonStyle(role: c.role))
+                .disabled(!c.enabled || model.isWorking)
+            }
+        }
+    }
+
+    private var upcomingList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Up next")
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(Array(model.upcoming.prefix(4).enumerated()),
+                    id: \.element.id) { i, song in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("\(i + 1)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 14, alignment: .trailing)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(song.title ?? "(untitled)")
+                            .font(.footnote)
+                        Text(song.artist ?? "")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color(.secondarySystemBackground),
+                    in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    @ViewBuilder
+    private var statusText: some View {
+        let err = model.player.lastError
+        Text(err ?? model.status)
+            .font(.footnote)
+            .foregroundStyle(err != nil ? Color.red : Color.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+    }
+}
+
+// MARK: - Add Music sheet
+
+/// Search sheet presented by the "Add Music" button. Search for an artist or
+/// song and tap a result to add it to the current station as a seed.
+struct AddMusicSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    TextField("artist, song, or music token",
+                              text: $model.searchText)
+                        .autocorrectionDisabled()
+                        .autocapitalization(.none)
+                        .focused($focused)
+                        .submitLabel(.search)
+                        .onSubmit { model.doSearch() }
+                    Button("Search") { model.doSearch() }
+                        .buttonStyle(.bordered)
+                        .disabled(model.searchText.isEmpty || model.isWorking)
+                }
+
+                if let result = model.searchResult {
+                    if !result.artists.isEmpty {
+                        Text("Artists — tap to add to station")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(result.artists) { a in
+                            Button {
+                                model.addSeedFromMusicId(a.musicId)
+                                dismiss()
+                            } label: {
+                                Text(a.name)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    if !result.songs.isEmpty {
+                        Text("Songs — tap to add to station")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(result.songs) { s in
+                            Button {
+                                model.addSeedFromMusicId(s.musicId)
+                                dismiss()
+                            } label: {
+                                Text("\(s.title) — \(s.artist)")
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    if result.isEmpty {
+                        Text("No results.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Search for an artist or song to add to the current station.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Add Music")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        model.searchResult = nil
+                        model.searchText = ""
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .onAppear { focused = true }
+    }
+}
+
+// MARK: - Button styling
+
+private struct GridButtonStyle: ButtonStyle {
+    let role: Control.Role
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(foreground)
+            .background(background, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(border, lineWidth: 1)
+            )
+            .opacity(configuration.isPressed ? 0.6 : 1.0)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+
+    private var foreground: Color {
+        switch role {
+        case .prominent: return .white
+        case .destructive: return .red
+        case .loved: return .red
+        case .normal: return .primary
+        }
+    }
+
+    private var background: Color {
+        switch role {
+        case .prominent: return .accentColor
+        case .destructive: return Color.red.opacity(0.1)
+        case .loved: return Color.red.opacity(0.15)
+        case .normal: return Color(.secondarySystemBackground)
+        }
+    }
+
+    private var border: Color {
+        switch role {
+        case .prominent: return .clear
+        case .destructive: return .red.opacity(0.35)
+        case .loved: return .red.opacity(0.5)
+        case .normal: return Color(.separator).opacity(0.4)
         }
     }
 }

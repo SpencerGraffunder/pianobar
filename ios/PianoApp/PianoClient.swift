@@ -283,6 +283,13 @@ final class PianoClient {
 
     /// Perform the HTTP POST and return the response body.
     /// Mirrors BarPianoHttpRequest in ui.c.
+    ///
+    /// Retries transient server errors (502/503/504) up to 3 times with a
+    /// short backoff. Pandora's gateway is known to return intermittent
+    /// 504 "upstream request timeout" (see the deviceModel note above and
+    /// the regression guard in PianoNetworkTests) — a single flaky 504
+    /// should not hard-fail the request. 4xx and other non-transient
+    /// failures throw immediately.
     private func performHTTP(path: String, secure: Bool,
                              postData: UnsafeMutablePointer<CChar>?)
         async throws -> Data
@@ -304,12 +311,35 @@ final class PianoClient {
             http.httpBody = Data(bytes: post, count: len)
         }
 
-        let (data, response) = try await URLSession.shared.data(for: http)
-        if let httpResp = response as? HTTPURLResponse,
-           !(200..<300).contains(httpResp.statusCode) {
-            throw PianoError.network("HTTP \(httpResp.statusCode)")
+        // Diagnostic: log the exact outgoing request (URL + headers + size).
+        let reqHdrs = (http.allHTTPHeaderFields ?? [:])
+            .map { "\($0.key): \($0.value)" }.sorted().joined(separator: " | ")
+        let bodyLen = http.httpBody?.count ?? 0
+        NSLog("PianoHTTP REQ URL=%@ | hdrs=[%@] | bodyBytes=%d",
+              url.absoluteString, reqHdrs, Int32(bodyLen))
+
+        let transient = Set([502, 503, 504])
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let (data, response) = try await URLSession.shared.data(for: http)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let respHdrs = ((response as? HTTPURLResponse)?.allHeaderFields as? [String: Any] ?? [:])
+            let respHdrsS = respHdrs.map { "\($0.key): \($0.value)" }.sorted().joined(separator: " | ")
+            let bodyS = String((String(data: data, encoding: .utf8) ?? "(binary \(data.count)B)").prefix(400))
+            NSLog("PianoHTTP RESP attempt=%d | status=%d | hdrs=[%@] | body=%@",
+                  Int32(attempt), Int32(status), respHdrsS, bodyS)
+            if (200..<300).contains(status) {
+                return data
+            }
+            if transient.contains(status) && attempt < maxAttempts {
+                NSLog("PianoHTTP transient HTTP %d — retrying (backoff)", status)
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                continue
+            }
+            throw PianoError.network("HTTP \(status)")
         }
-        return data
+        // Unreachable: the loop either returns or throws on each pass.
+        fatalError("performHTTP: exhausted retry loop without returning")
     }
 
     // MARK: - API
@@ -446,20 +476,24 @@ final class PianoClient {
         return result
     }
 
-    /// Create a station from a music token (song or artist musicId).
-    /// The new station is appended to the handle's station list
-    /// (response.c CREATE_STATION), so it will be `stations().last`.
-    func createStation(token: String, fromArtist: Bool) async throws {
-        let t = cCopy(token)
+    /// Create a station from a musicToken (the `musicId` of a search result).
+    ///
+    /// Search results carry a **musicToken** (e.g. `"R35828"`), not a
+    /// trackToken. The core emits the `"musicToken"` JSON field only when the
+    /// data `type` is `PIANO_MUSICTYPE_INVALID` (request.c CREATE_STATION).
+    /// Using the SONG/ARTIST types would emit `"trackToken"`, which Pandora
+    /// rejects with `{"stat":"fail","message":"An unexpected error occurred"}`.
+    /// This matches the original `BarUiActCreateStation` exactly.
+    ///
+    /// The new station is appended to the handle's station list (response.c
+    /// CREATE_STATION), so it will be `stations().last`.
+    func createStation(musicToken: String) async throws {
+        let t = cCopy(musicToken)
         defer { free(t) }
         try await runData(PIANO_REQUEST_CREATE_STATION) {
             (d: UnsafeMutablePointer<PianoRequestDataCreateStation_t>) in
             d.pointee.token = t
-            if fromArtist {
-                PianoIosCreateStationFromArtist(d)
-            } else {
-                PianoIosCreateStationFromSong(d)
-            }
+            PianoIosCreateStationFromMusicToken(d)
         }
     }
 
@@ -472,5 +506,57 @@ final class PianoClient {
             d.pointee.station = station.raw
             d.pointee.musicId = m
         }
+    }
+
+    /// Register which stations are included in the current QuickMix station's
+    /// playlist. No per-station data: the core reads each station's
+    /// `useQuickMix` flag (request.c SET_QUICKMIX builds quickMixStationIds).
+    /// The caller sets those flags first. Only meaningful when the current
+    /// station is itself a QuickMix station (`isQuickMix`).
+    func setQuickMix() async throws {
+        try await call(PIANO_REQUEST_SET_QUICKMIX, data: nil)
+    }
+
+    /// Bookmark the current song ("add to my library").
+    func bookmark(_ song: Song) async throws {
+        try await call(PIANO_REQUEST_BOOKMARK_SONG,
+                       data: UnsafeMutableRawPointer(song.raw))
+    }
+
+    /// Rename the selected station.
+    func renameStation(_ station: Station, newName: String) async throws {
+        let n = cCopy(newName)
+        defer { free(n) }
+        try await runData(PIANO_REQUEST_RENAME_STATION) {
+            (d: UnsafeMutablePointer<PianoRequestDataRenameStation_t>) in
+            d.pointee.station = station.raw
+            d.pointee.newName = n
+        }
+    }
+
+    /// Delete a station (server + local list). After this call the
+    /// `Station`'s underlying C struct is freed — do not use it again.
+    func deleteStation(_ station: Station) async throws {
+        try await call(PIANO_REQUEST_DELETE_STATION,
+                       data: UnsafeMutableRawPointer(station.raw))
+    }
+
+    /// Ask why the current song was played. Returns a human-readable
+    /// explanation (may be empty if the server has none).
+    func explain(_ song: Song) async throws -> String {
+        var out = ""
+        try await runData(
+            PIANO_REQUEST_EXPLAIN,
+            setup: { (d: UnsafeMutablePointer<PianoRequestDataExplain_t>) in
+                d.pointee.song = song.raw
+                d.pointee.retExplain = nil
+            },
+            finish: { (d: UnsafeMutablePointer<PianoRequestDataExplain_t>) in
+                if let e = d.pointee.retExplain {
+                    out = String(cString: e)
+                    free(e) // core malloc'd it (response.c EXPLAIN)
+                }
+            })
+        return out
     }
 }

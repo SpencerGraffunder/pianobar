@@ -32,6 +32,7 @@ void PianoIosFreeResponseData (PianoRequest_t *req);
  * Swift). */
 void PianoIosCreateStationFromSong (PianoRequestDataCreateStation_t *d);
 void PianoIosCreateStationFromArtist (PianoRequestDataCreateStation_t *d);
+void PianoIosCreateStationFromMusicToken (PianoRequestDataCreateStation_t *d);
 
 #ifdef __cplusplus
 }

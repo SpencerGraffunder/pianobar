@@ -24,3 +24,14 @@ void PianoIosCreateStationFromSong (PianoRequestDataCreateStation_t *d) {
 void PianoIosCreateStationFromArtist (PianoRequestDataCreateStation_t *d) {
 	d->type = PIANO_MUSICTYPE_ARTIST;
 }
+
+/*
+ * Search results carry a musicId (a *musicToken*), not a trackToken. The
+ * original pianobar (BarUiActCreateStation) sends it with type INVALID so
+ * request.c emits the "musicToken" JSON field. Using the SONG/ARTIST types
+ * would emit "trackToken" and Pandora rejects the request with
+ * {"stat":"fail","message":"An unexpected error occurred"}.
+ */
+void PianoIosCreateStationFromMusicToken (PianoRequestDataCreateStation_t *d) {
+	d->type = PIANO_MUSICTYPE_INVALID;
+}

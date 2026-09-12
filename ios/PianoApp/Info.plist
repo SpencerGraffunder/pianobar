@@ -21,6 +21,30 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<!--
+		This is a Pandora streaming client. Two classes of traffic are plain HTTP
+		(the original libcurl/ffplay-based pianobar does the same):
+	
+		1. RPC calls — the C core (src/libpiano/request.c) defaults to "no tls"
+		   for some methods (e.g. user.getStationList, music.search) and only opts
+		   login/getPlaylist into TLS. Host: tuner.pandora.com.
+	
+		2. Audio streams — Pandora serves audio over plain HTTP from rotating CDN
+		   edge hosts (observed: t1-3.p-cdn.us, t1-4.p-cdn.us). AVPlayer enforces
+		   ATS and these were failing with NSURLErrorDomain -1022
+		   ("App Transport Security policy requires the use of a secure
+		   connection"), which is why some songs played (HTTPS node) and some
+		   didn't (plain-HTTP node).
+	
+		Since the audio CDN domains are not fixed, scoping an exception to them is
+		fragile. Allow arbitrary loads so every track can play. This is a
+		sideloaded personal client (not App Store), so this is acceptable.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIBackgroundModes</key>

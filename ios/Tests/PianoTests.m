@@ -468,6 +468,13 @@
 
     PianoIosCreateStationFromArtist(&d);
     XCTAssertEqual(d.type, PIANO_MUSICTYPE_ARTIST);
+
+    // Search results carry a musicToken, so the create-station request must
+    // use the INVALID type (which emits the "musicToken" JSON field).
+    // Regression guard: using SONG/ARTIST here emits "trackToken" and Pandora
+    // rejects the request with "An unexpected error occurred".
+    PianoIosCreateStationFromMusicToken(&d);
+    XCTAssertEqual(d.type, PIANO_MUSICTYPE_INVALID);
 }
 
 #pragma mark - Ownership stress
