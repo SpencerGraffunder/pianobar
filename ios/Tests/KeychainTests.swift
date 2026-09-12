@@ -12,8 +12,38 @@ final class KeychainTests: XCTestCase {
     private let testUser = "pb_unit_test_user"
     private let testPass = "pb_unit_test_password_123"
 
-    override func setUp() {
-        super.setUp()
+    /// errSecInteractionNotAllowed — the keychain refused the operation
+    /// (locked / headless session). Not a bug in our code.
+    private static let errSecInteractionNotAllowed: OSStatus = -34018
+
+    /// Probe the keychain once per test process. On a headless CI runner the
+    /// simulator keychain denies ALL SecItem data access with -34018 and can't
+    /// be unlocked (Xcode 26 removed `simctl unlock`) — in that environment we
+    /// skip. Any *other* failure is a real bug and must fail loudly. (Same
+    /// pattern as PianoNetworkTests skipping when pandora.com is unreachable.)
+    private static let keychainState: String = {
+        let status = Keychain.save(username: "__keychain_probe__", password: "__probe__")
+        Keychain.delete()
+        switch status {
+        case errSecSuccess:
+            return "usable"
+        case errSecInteractionNotAllowed:
+            return "interaction-denied"
+        default:
+            return "unexpected-\(status)"
+        }
+    }()
+
+    override func setUpWithError() throws {
+        try super.setUp()
+        switch Self.keychainState {
+        case "usable":
+            break
+        case "interaction-denied":
+            throw XCTSkip("Keychain denies SecItem interaction in this environment (errSecInteractionNotAllowed, e.g. a headless CI runner) — the tests run for real on a normal Mac or device")
+        default:
+            XCTFail("Keychain probe failed with unexpected OSStatus: \(Self.keychainState)")
+        }
         Keychain.delete()
     }
 
