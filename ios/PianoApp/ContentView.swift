@@ -125,14 +125,20 @@ final class AppModel: ObservableObject {
             guard let client = self.client else { return }
             try await client.login()
             self.loggedIn = true
-            // Remember the credentials for next time.
-            Keychain.save(username: self.username, password: self.password)
+            // Remember the credentials for next time. (If the keychain is
+            // unavailable the login still works; we just won't auto-login
+            // next time.)
+            var saveStatus = Keychain.save(username: self.username, password: self.password)
             try await client.getStations()
             self.stations = client.stations()
             if self.selectedStationID == nil, let first = self.stations.first {
                 self.selectedStationID = first.stableId
             }
-            self.status = "Logged in. \(self.stations.count) station(s)."
+            if saveStatus == errSecSuccess {
+                self.status = "Logged in. \(self.stations.count) station(s)."
+            } else {
+                self.status = "Logged in (couldn't remember credentials: OSStatus \(saveStatus)). \(self.stations.count) station(s)."
+            }
         }
     }
 

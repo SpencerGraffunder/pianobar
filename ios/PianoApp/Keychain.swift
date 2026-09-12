@@ -25,17 +25,21 @@ enum Keychain {
     }
 
     /// Save the credentials, replacing any previously stored pair.
-    static func save(username: String, password: String) {
+    /// Returns `errSecSuccess` on success; callers should check the result
+    /// (a locked keychain — e.g. a freshly booted, never-unlocked
+    /// simulator in CI — makes SecItemAdd fail with a non-zero status).
+    @discardableResult
+    static func save(username: String, password: String) -> OSStatus {
         guard let data = try? JSONSerialization.data(
             withJSONObject: ["username": username, "password": password]
-        ) else { return }
+        ) else { return OSStatus(-50) /* errSecInvalidArgument */ }
         var query = baseQuery()
         query[kSecValueData as String] = data
         // Available after the device is first unlocked — a music app may
         // keep playing in the background, so no biometrics are required.
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemDelete(baseQuery() as CFDictionary)
-        SecItemAdd(query as CFDictionary, nil)
+        return SecItemAdd(query as CFDictionary, nil)
     }
 
     /// Load the saved credentials, or nil if none are stored.

@@ -1,16 +1,20 @@
 #
 # iOS CI — build the pianobar iOS app (ios/) and produce an .ipa.
 #
-# Steps:
-#   1. Generate the Xcode project from ios/project.yml (xcodegen).
-#   2. Run the unit tests on an iOS simulator.
-#   3. Build a Release archive for a generic iOS device (code signing
-#      disabled — no Apple credentials needed).
-#   4. Assemble the .app into a (unsigned) .ipa and publish it as a
-#      GitHub RELEASE asset — downloads are a bare .ipa file (Actions
-#      artifacts are always wrapped in a .zip). An unsigned .ipa can be
-#      installed with any re-signing tool (Sideloadly, AltStore,
-#      TrollStore, ...) or with your own ad-hoc profile.
+# Two jobs, split to keep Actions minutes low:
+#
+#   build    — on every push/PR that touches iOS code: a fast compile
+#              check only. NO simulator tests, no .ipa. (~2 min)
+#
+#   release  — on a tag push (v*) or a manual "Run workflow" dispatch:
+#              the full pipeline — unit tests on the iOS simulator, a
+#              Release build, an unsigned .ipa, and a GitHub Release
+#              publish. Tag pushes publish under their tag name; manual
+#              dispatch refreshes the rolling 'ios-latest' release.
+#
+# Getting a new .ipa:
+#   git tag v1.1.0 && git push origin v1.1.0     (or)
+#   GitHub repo → Actions → ios → "Run workflow"
 #
 # To produce a *signed* .ipa instead, add the usual Apple secrets
 # (certificates / provisioning profile) and swap the export step for
@@ -25,6 +29,8 @@ on:
       - 'ios/**'
       - 'src/libpiano/**'
       - '.github/workflows/ios.yml'
+    tags:
+      - 'v*'
   pull_request:
     paths:
       - 'ios/**'
@@ -32,12 +38,39 @@ on:
       - '.github/workflows/ios.yml'
   workflow_dispatch:
 
-# Needed to publish the .ipa as a release asset (rolling 'ios-latest').
+# Needed to publish the .ipa as a release asset.
 permissions:
   contents: write
 
 jobs:
+  # Fast compile check on regular pushes/PRs — no tests, no .ipa.
   build:
+    if: (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) || github.event_name == 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Compile check (Release, unsigned, no tests)
+        run: |
+          xcodebuild -project ios/Piano.xcodeproj -scheme PianoApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="-" \
+            build
+
+  # Full pipeline (tests + .ipa + release publish) — tag pushes and
+  # manual "Run workflow" dispatches only.
+  release:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -91,20 +124,22 @@ jobs:
           ls -lh pianobar-ios.ipa
 
       - name: Publish .ipa as GitHub Release (bare file, no zip)
-        # PR runs (esp. from forks) get a read-only token; publish only on push/dispatch.
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Rolling release: always holds the newest CI build. Release
-          # assets download as the bare .ipa (Actions artifacts are always
+          # Tag pushes publish under their tag name; manual dispatch
+          # refreshes the rolling 'ios-latest' release. Release assets
+          # download as the bare .ipa (Actions artifacts are always
           # zipped, which is why we don't use them for the .ipa).
           TAG=ios-latest
+          if [ "$GITHUB_REF_NAME" != "master" ] && [ -n "$GITHUB_REF_NAME" ] && [ "${GITHUB_REF_NAME#v}" != "$GITHUB_REF_NAME" ]; then
+            TAG="$GITHUB_REF_NAME"
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" pianobar-ios.ipa --clobber
           else
             gh release create "$TAG" pianobar-ios.ipa \
-              --title "iOS build (latest CI)" \
+              --title "iOS build ($TAG)" \
               --notes "Unsigned .ipa from CI. Re-sign with Sideloadly / AltStore / an ad-hoc profile to install."
           fi
           gh release view "$TAG"

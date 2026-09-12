@@ -22,34 +22,54 @@ final class KeychainTests: XCTestCase {
         super.tearDown()
     }
 
+    /// Diagnostic: the raw SecItemCopyMatching status for our item, so a
+    /// failing load() reports WHY (e.g. errSecInteractionNotAllowed =
+    /// keychain locked) instead of just "nil".
+    private func loadStatus() -> OSStatus {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "net.6xq.pianobar.ios",
+            kSecAttrAccount as String: "pandora-credentials",
+        ]
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        return SecItemCopyMatching(query as CFDictionary, &result)
+    }
+
     func testLoadReturnsNilWhenEmpty() {
         XCTAssertNil(Keychain.load())
     }
 
     func testSaveLoadRoundTrip() {
-        Keychain.save(username: testUser, password: testPass)
+        let status = Keychain.save(username: testUser, password: testPass)
+        XCTAssertEqual(status, errSecSuccess,
+                       "SecItemAdd failed with OSStatus \(status) — the keychain is locked (e.g. a never-unlocked CI simulator) or unavailable")
         let saved = Keychain.load()
+        if saved == nil {
+            XCTFail("load() returned nil; SecItemCopyMatching status = \(loadStatus())")
+        }
         XCTAssertEqual(saved?.username, testUser)
         XCTAssertEqual(saved?.password, testPass)
     }
 
     func testSaveReplacesPrevious() {
-        Keychain.save(username: testUser, password: "first")
-        Keychain.save(username: testUser, password: testPass)
+        XCTAssertEqual(Keychain.save(username: testUser, password: "first"), errSecSuccess)
+        XCTAssertEqual(Keychain.save(username: testUser, password: testPass), errSecSuccess)
         let saved = Keychain.load()
         XCTAssertEqual(saved?.username, testUser)
         XCTAssertEqual(saved?.password, testPass)
     }
 
     func testDeleteRemovesCredentials() {
-        Keychain.save(username: testUser, password: testPass)
+        XCTAssertEqual(Keychain.save(username: testUser, password: testPass), errSecSuccess)
         Keychain.delete()
         XCTAssertNil(Keychain.load())
     }
 
     func testUsernameWithSpecialCharacters() {
         let tricky = "user@ex ample.com"
-        Keychain.save(username: tricky, password: "p@$$wörd — 100%")
+        XCTAssertEqual(Keychain.save(username: tricky, password: "p@$$wörd — 100%"), errSecSuccess)
         let saved = Keychain.load()
         XCTAssertEqual(saved?.username, tricky)
         XCTAssertEqual(saved?.password, "p@$$wörd — 100%")
