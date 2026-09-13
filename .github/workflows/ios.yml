@@ -3,17 +3,21 @@
 #
 # Two jobs, split to keep Actions minutes low:
 #
-#   build    — on every push/PR that touches iOS code: a fast compile
-#              check only. NO simulator tests, no .ipa. (~2 min)
+#   build    — on PRs and pushes to non-default branches that touch iOS
+#              code: a fast compile check only. NO simulator tests,
+#              no .ipa. (~2 min)
 #
-#   release  — on a tag push (v*) or a manual "Run workflow" dispatch:
-#              the full pipeline — unit tests on the iOS simulator, a
-#              Release build, an unsigned .ipa, and a GitHub Release
-#              publish. Tag pushes publish under their tag name; manual
-#              dispatch refreshes the rolling 'ios-latest' release.
+#   release  — on a push to the default branch (master), a tag push (v*),
+#              or a manual "Run workflow" dispatch: the full pipeline —
+#              unit tests on the iOS simulator, a Release build, an
+#              unsigned .ipa, and a GitHub Release publish. Tag pushes
+#              publish under their tag name; everything else refreshes
+#              the rolling 'ios-latest' release (same tag, asset
+#              replaced each push).
 #
 # Getting a new .ipa:
-#   git tag v1.1.0 && git push origin v1.1.0     (or)
+#   git push origin master                      (rolling 'ios-latest')
+#   git tag v1.1.0 && git push origin v1.1.0    (pinned tag)
 #   GitHub repo → Actions → ios → "Run workflow"
 #
 # To produce a *signed* .ipa instead, add the usual Apple secrets
@@ -43,9 +47,14 @@ permissions:
   contents: write
 
 jobs:
-  # Fast compile check on regular pushes/PRs — no tests, no .ipa.
+  # Fast compile check on PRs and pushes to non-default branches —
+  # no tests, no .ipa. Default-branch pushes go straight to the
+  # release job (which builds anyway) so we don't compile twice.
   build:
-    if: (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) || github.event_name == 'pull_request'
+    if: >-
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') &&
+       github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main') ||
+      github.event_name == 'pull_request'
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -67,10 +76,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="-" \
             build
 
-  # Full pipeline (tests + .ipa + release publish) — tag pushes and
-  # manual "Run workflow" dispatches only.
+  # Full pipeline (tests + .ipa + release publish) — pushes to the
+  # default branch, tag pushes, and manual "Run workflow" dispatches.
   release:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'))
     runs-on: macos-latest
     steps:
       - name: Checkout
