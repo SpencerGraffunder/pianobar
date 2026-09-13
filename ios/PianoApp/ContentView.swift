@@ -11,11 +11,13 @@
 
 import SwiftUI
 import Combine
+import UIKit
+import MediaPlayer
 
 // MARK: - View model
 
 @MainActor
-final class AppModel: ObservableObject {
+final class AppModel: ObservableObject, MediaSessionModel {
     // auth
     @Published var username = ""
     @Published var password = ""
@@ -57,6 +59,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var player = Player()
     private var playerCancellable: AnyCancellable?
 
+    /// Now Playing / lock screen / remote-control layer.
+    private var media: MediaSession!
+
+    /// A saved .m4a ready to share (Music / Files / …).
+    @Published var shareItem: ShareItem?
+    /// Device-picker sheet (stock iOS output picker).
+    @Published var showDevicePicker = false
+
     private var client: PianoClient?
     private var working = false
 
@@ -64,6 +74,7 @@ final class AppModel: ObservableObject {
         playerCancellable = player.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        media = MediaSession(model: self)
         // Restore saved credentials and log in automatically, so the user
         // doesn't have to re-enter them on every launch. (If the login
         // fails — bad password, no network — the error shows in the status
@@ -80,6 +91,49 @@ final class AppModel: ObservableObject {
     var selectedStation: Station? {
         guard let id = selectedStationID else { return nil }
         return stations.first { $0.stableId == id }
+    }
+
+    // MARK: MediaSessionModel (lock screen / Control Center / Bluetooth)
+
+    var npTitle: String? { currentSong?.title }
+    var npArtist: String? { currentSong?.artist }
+    var npAlbum: String? { currentSong?.album }
+    /// Prefer the player's measured duration; fall back to the core's
+    /// song length (seconds).
+    var npDuration: Double {
+        let d = player.duration
+        if d > 0 { return d }
+        return Double(currentSong?.length ?? 0)
+    }
+    var npElapsed: Double { player.elapsed }
+
+    var isPlayingNow: Bool { player.isPlaying }
+
+    func modelPlay() {
+        if let url = currentSong?.audioUrl, let u = URL(string: url) {
+            player.play(url: u)
+            updateNowPlaying()
+        }
+    }
+
+    func modelPause() {
+        player.pause()
+        updateNowPlaying()
+    }
+
+    func modelNext() { nextSong() }
+    func modelPrevious() { nextSong() } // Pandora: no backward skip
+
+    func resumable() -> Bool {
+        player.isPlaying || player.elapsed > 0
+    }
+
+    /// Publish the current song + transport state to Now Playing.
+    private func updateNowPlaying() {
+        media.updateNowPlaying(
+            title: npTitle, artist: npArtist, album: npAlbum,
+            duration: npDuration, elapsed: npElapsed,
+            playing: player.isPlaying)
     }
 
     var currentSong: Song? { playlist.first }
@@ -168,6 +222,7 @@ final class AppModel: ObservableObject {
         searchResult = nil
         selectedStationID = nil
         player.stop()
+        media.clearNowPlaying()
         // Forget the saved credentials so the next launch shows the login
         // screen. (Re-login stores the new credentials again.) Keep the
         // username for convenience; clear the password.
@@ -181,6 +236,7 @@ final class AppModel: ObservableObject {
     private func playIfAvailable() {
         if let url = currentSong?.audioUrl, let u = URL(string: url) {
             player.play(url: u)
+            updateNowPlaying()
         } else if currentSong != nil {
             status = "This song has no audio URL."
         }
@@ -203,8 +259,10 @@ final class AppModel: ObservableObject {
     func togglePlayback() {
         if player.isPlaying {
             player.pause()
+            updateNowPlaying()
         } else if let url = currentSong?.audioUrl, let u = URL(string: url) {
             player.play(url: u)
+            updateNowPlaying()
         } else {
             // No playable song yet (empty queue, or the current song has no
             // audio URL) — fetch the next song from the station and start it.
@@ -214,6 +272,7 @@ final class AppModel: ObservableObject {
 
     func stopPlayback() {
         player.stop()
+        updateNowPlaying()
         status = "Stopped."
     }
 
@@ -386,6 +445,35 @@ final class AppModel: ObservableObject {
         status = "Volume reset."
     }
 
+    // MARK: Save song (download + transcode → share to Music/Files)
+
+    /// Download the current song and transcode to .m4a, then present the
+    /// system share sheet (Music and Files are both share targets).
+    func saveSong() {
+        guard let song = currentSong,
+              let urlStr = song.audioUrl,
+              let url = URL(string: urlStr) else {
+            status = "No song to save."
+            return
+        }
+        guard !working else { return }
+        working = true
+        isWorking = true
+        status = "Saving song…"
+        Task { [weak self] in
+            do {
+                let file = try await SongSaver.save(url: url,
+                                                     title: song.title ?? "")
+                self?.status = "Saved — choose where to put it."
+                self?.shareItem = ShareItem(url: file)
+            } catch {
+                self?.status = "Save failed: \(error.localizedDescription)"
+            }
+            self?.isWorking = false
+            self?.working = false
+        }
+    }
+
     // MARK: Search
 
     func doSearch() {
@@ -551,6 +639,10 @@ struct ContentView: View {
         .sheet(isPresented: $model.showAddSearch) {
             AddMusicSheet(model: model)
         }
+        .sheet(isPresented: $model.showDevicePicker) {
+            DevicePickerSheet()
+        }
+        .sheet(item: $model.shareItem) { ShareSheet(url: $0.url) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button { model.refreshStations() } label: {
@@ -642,6 +734,13 @@ struct ContentView: View {
                   action: { model.confirmDelete = true }),
             .init(id: "quickmix", title: "Quick Mix", systemImage: "shuffle",
                   role: .normal, enabled: hasStation, action: model.toggleQuickMix),
+            .init(id: "device", title: "Device", systemImage: "hifispeaker",
+                  role: .normal, enabled: true,
+                  action: { model.showDevicePicker = true }),
+            .init(id: "save", title: "Save", systemImage: "square.and.arrow.down",
+                  role: .normal,
+                  enabled: hasSong && model.currentSong?.audioUrl != nil,
+                  action: model.saveSong),
         ]
 
         return LazyVGrid(columns: columns, spacing: 10) {
@@ -829,4 +928,65 @@ private struct GridButtonStyle: ButtonStyle {
 
 #Preview {
     ContentView()
+}
+
+// MARK: - Device picker (stock iOS output picker)
+
+/// A saved song file, Identifiable for `.sheet(item:)`.
+struct ShareItem: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+/// A button showing the stock iOS route button (speaker icon). Tapping
+/// it opens the system output picker (speaker / headphones / Bluetooth /
+/// AirPlay) — the same picker the volume HUD shows in other apps.
+struct DevicePickerButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let v = MPVolumeView()
+        v.showsRouteButton = true   // includes AirPlay on modern iOS
+        v.showsVolumeSlider = false
+        v.frame = CGRect(x: 0, y: 0, width: 48, height: 48)
+        return v
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+}
+
+/// Sheet with the stock output picker (the system AirPlay/output button
+/// from `MPVolumeView` — tapping it opens the stock picker listing
+/// speaker, headphones, Bluetooth, and AirPlay targets).
+struct DevicePickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Play through…")
+                .font(.headline)
+            DevicePickerButton()
+                .frame(width: 64, height: 64)
+            Text("Tap the speaker button to open the system picker\n(speaker, headphones, Bluetooth, AirPlay).")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer()
+            Button("Done") { dismiss() }
+                .buttonStyle(.bordered)
+        }
+        .padding(24)
+    }
+}
+
+// MARK: - Share sheet (saved song → Music / Files / …)
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url],
+                                 applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ vc: UIActivityViewController,
+                                context: Context) {}
 }

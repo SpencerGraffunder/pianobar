@@ -75,9 +75,12 @@ xcrun swiftc -O \
     ios/PianoApp/PianoClient.swift \
     ios/PianoApp/Player.swift \
     ios/PianoApp/Keychain.swift \
+    ios/PianoApp/MediaSession.swift \
+    ios/PianoApp/SongSaver.swift \
     "$BUILD/libpiano_ios.a" \
     -framework SwiftUI \
     -framework AVFoundation \
+    -framework MediaPlayer \
     -framework Security \
     -o "$BUILD/PianoApp.app/PianoApp"
 

@@ -61,6 +61,9 @@ final class Player: ObservableObject {
 
     func play(url: URL) {
         stop()
+        try? AVAudioSession.sharedInstance()
+            .setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
         let item = AVPlayerItem(url: url)
         let newPlayer = AVPlayer(playerItem: item)
         newPlayer.volume = volume
@@ -85,6 +88,39 @@ final class Player: ObservableObject {
             self.endObserver = nil
         }
         isPlaying = false
+        // Release the audio session so other apps can play (the
+        // system re-activates it on the next play()).
+        try? AVAudioSession.sharedInstance().setActive(false,
+            options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: Now Playing support
+
+    /// Elapsed playback time of the current item (0 if none/unknown).
+    var elapsed: Double {
+        let t = player?.currentTime() ?? .zero
+        let s = t.seconds
+        return s.isFinite ? max(0, s) : 0
+    }
+
+    /// Duration of the current item (0 if not yet known).
+    var duration: Double {
+        guard let d = player?.currentItem?.duration, d.seconds.isFinite,
+              d.seconds > 0 else { return 0 }
+        return d.seconds
+    }
+
+    /// Resume the current item (used by media-session auto-resume).
+    func resume() {
+        guard let player else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        player.play()
+        isPlaying = true
+    }
+
+    /// `PlayerLike` conformance: (re)start the current item.
+    func play() {
+        resume()
     }
 
     // MARK: Volume
