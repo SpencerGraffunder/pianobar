@@ -10,7 +10,8 @@
 #   release  — on a push to the default branch (master), a tag push (v*),
 #              or a manual "Run workflow" dispatch: the full pipeline —
 #              unit tests on the iOS simulator, a Release build, an
-#              unsigned .ipa, and a GitHub Release publish. Tag pushes
+#              unsigned .ipa (uploaded as a run artifact AND published
+#              as a GitHub Release). Tag pushes
 #              publish under their tag name; everything else refreshes
 #              the rolling 'ios-latest' release (same tag, asset
 #              replaced each push).
@@ -134,6 +135,17 @@ jobs:
           zip -qry ../pianobar-ios.ipa Payload
           cd ..
           ls -lh pianobar-ios.ipa
+
+      # Also attach it to the run so it shows up in the Actions
+      # "Artifacts" tab (download there is a .zip, but it's handy to
+      # have the file right in the run). The GitHub Release below is
+      # still the preferred download path because it's a bare .ipa.
+      - name: Upload .ipa as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pianobar-ios.ipa
+          path: pianobar-ios.ipa
+          if-no-files-found: error
 
       - name: Publish .ipa as GitHub Release (bare file, no zip)
         env:
