@@ -270,12 +270,6 @@ final class AppModel: ObservableObject, MediaSessionModel {
         }
     }
 
-    func stopPlayback() {
-        player.stop()
-        updateNowPlaying()
-        status = "Stopped."
-    }
-
     // MARK: Rating
 
     private func advanceAfterRating() async throws {
@@ -703,9 +697,6 @@ struct ContentView: View {
                   action: model.togglePlayback),
             .init(id: "next", title: "Next", systemImage: "forward.fill",
                   role: .normal, enabled: hasStation, action: model.nextSong),
-            .init(id: "stop", title: "Stop", systemImage: "stop.fill",
-                  role: .normal, enabled: model.player.isPlaying,
-                  action: model.stopPlayback),
             .init(id: "upcoming", title: "Upcoming", systemImage: "list.bullet",
                   role: .normal, enabled: hasUpcoming,
                   action: model.toggleUpcoming),
