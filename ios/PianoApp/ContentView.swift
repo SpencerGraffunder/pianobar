@@ -66,6 +66,8 @@ final class AppModel: ObservableObject, MediaSessionModel {
     @Published var shareItem: ShareItem?
     /// Device-picker sheet (stock iOS output picker).
     @Published var showDevicePicker = false
+    /// Help sheet (explains every button).
+    @Published var showHelp = false
 
     private var client: PianoClient?
     private var working = false
@@ -641,6 +643,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.showDevicePicker) {
             DevicePickerSheet()
         }
+        .sheet(isPresented: $model.showHelp) {
+            HelpSheet()
+        }
         .sheet(item: $model.shareItem) { ShareSheet(url: $0.url) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -742,6 +747,9 @@ struct ContentView: View {
                   role: .normal,
                   enabled: hasSong && model.currentSong?.audioUrl != nil,
                   action: model.saveSong),
+            .init(id: "help", title: "Help", systemImage: "questionmark.circle",
+                  role: .normal, enabled: true,
+                  action: { model.showHelp = true }),
         ]
 
         return LazyVGrid(columns: columns, spacing: 10) {
@@ -929,6 +937,86 @@ private struct GridButtonStyle: ButtonStyle {
 
 #Preview {
     ContentView()
+}
+
+// MARK: - Help sheet (what each button does)
+
+/// One row in the help sheet: icon, name, one-sentence explanation.
+private struct HelpEntry: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+    let detail: String
+}
+
+/// Large sheet opened from the Help button. Lists every other button in the
+/// app (grid + toolbar), each with a one-sentence explanation.
+struct HelpSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let entries: [HelpEntry] = [
+        HelpEntry(id: "playpause", title: "Play / Pause", systemImage: "play.fill",
+                  detail: "Starts or pauses the current song; if nothing is queued it fetches the next song from your station first."),
+        HelpEntry(id: "next", title: "Next", systemImage: "forward.fill",
+                  detail: "Skips ahead and starts the next song from the selected station."),
+        HelpEntry(id: "stop", title: "Stop", systemImage: "stop.fill",
+                  detail: "Stops playback and clears the queue."),
+        HelpEntry(id: "upcoming", title: "Upcoming", systemImage: "list.bullet",
+                  detail: "Toggles the list of the next few songs in the queue."),
+        HelpEntry(id: "love", title: "Love", systemImage: "heart.fill",
+                  detail: "Tells Pandora you love this song so you'll hear more like it; tap again on the same song to clear the heart."),
+        HelpEntry(id: "ban", title: "Ban", systemImage: "nosign",
+                  detail: "Tells Pandora to stop playing this song and then moves on to the next one."),
+        HelpEntry(id: "tired", title: "Tired", systemImage: "zzz",
+                  detail: "Tells Pandora you've heard this one too many times and then moves on to the next song."),
+        HelpEntry(id: "explain", title: "Explain", systemImage: "questionmark.circle",
+                  detail: "Shows Pandora's reason for playing this song (which seed it came from)."),
+        HelpEntry(id: "addseed", title: "Add Music", systemImage: "plus.circle",
+                  detail: "Opens a search where you can add an artist or song to the current station as a seed."),
+        HelpEntry(id: "rename", title: "Rename", systemImage: "pencil",
+                  detail: "Renames the currently selected station."),
+        HelpEntry(id: "delete", title: "Delete", systemImage: "trash",
+                  detail: "Deletes the currently selected station from your account."),
+        HelpEntry(id: "quickmix", title: "Quick Mix", systemImage: "shuffle",
+                  detail: "On a QuickMix station, switches which of your stations it blends and plays the new mix."),
+        HelpEntry(id: "device", title: "Device", systemImage: "hifispeaker",
+                  detail: "Opens the system picker to choose where audio plays (speaker, headphones, Bluetooth, AirPlay)."),
+        HelpEntry(id: "save", title: "Save", systemImage: "square.and.arrow.down",
+                  detail: "Downloads the current song as an .m4a and lets you save it to Music or Files."),
+        HelpEntry(id: "refresh", title: "Refresh", systemImage: "arrow.clockwise",
+                  detail: "Re-loads your station list from your Pandora account (top-right toolbar)."),
+        HelpEntry(id: "logout", title: "Log out", systemImage: "rectangle.portrait.and.arrow.right",
+                  detail: "Ends the session and returns you to the login screen (top-right toolbar)."),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List(entries) { e in
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: e.systemImage)
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 26)
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(e.title)
+                            .font(.subheadline.weight(.semibold))
+                        Text(e.detail)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .navigationTitle("What each button does")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+    }
 }
 
 // MARK: - Device picker (stock iOS output picker)
