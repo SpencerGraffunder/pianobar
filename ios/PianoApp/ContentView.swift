@@ -154,10 +154,14 @@ final class AppModel: ObservableObject, MediaSessionModel {
         working = true
         isWorking = true
         status = label + "…"
+        let started = status
         Task {
             do {
                 try await work()
-                status = label + " done."
+                // Only apply the default success message when the action
+                // did not set a more specific one itself (e.g. the Explain
+                // button's "We're playing this track because it features …").
+                if status == started { status = label + " done." }
             } catch {
                 status = "Error: \(error.localizedDescription)"
             }
