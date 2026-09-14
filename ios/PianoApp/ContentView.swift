@@ -71,6 +71,10 @@ final class AppModel: ObservableObject, MediaSessionModel {
 
     private var client: PianoClient?
     private var working = false
+    /// Remembers the last station the user played so the app can restore
+    /// and auto-play it on the next launch (issue #4). Injectable so tests
+    /// can point it at a private `UserDefaults` suite.
+    var lastStation: LastStationStore = LastStationStore()
 
     init() {
         playerCancellable = player.objectWillChange.sink { [weak self] _ in
@@ -191,13 +195,28 @@ final class AppModel: ObservableObject, MediaSessionModel {
             var saveStatus = Keychain.save(username: self.username, password: self.password)
             try await client.getStations()
             self.stations = client.stations()
-            if self.selectedStationID == nil, let first = self.stations.first {
+            // Restore the most recently played station (issue #4); fall
+            // back to the first station if there's none saved or it's gone.
+            if let last = self.lastStation.load(),
+               let match = self.stations.first(where: { $0.stableId == last }) {
+                self.selectedStationID = match.stableId
+            } else if self.selectedStationID == nil, let first = self.stations.first {
                 self.selectedStationID = first.stableId
             }
+            // Auto-play a song from the selected station on launch (issue
+            // #4). Covers both "restore the last station and play from it"
+            // and "no station was played before — start from the first".
+            // A failure here must not hide the fact that the login itself
+            // succeeded.
             if saveStatus == errSecSuccess {
                 self.status = "Logged in. \(self.stations.count) station(s)."
             } else {
                 self.status = "Logged in (couldn't remember credentials: OSStatus \(saveStatus)). \(self.stations.count) station(s)."
+            }
+            do {
+                try await self.autoPlayFirstSongIfNeeded()
+            } catch {
+                self.status = "Logged in, but couldn't start music: \(error.localizedDescription)"
             }
         }
     }
@@ -234,6 +253,10 @@ final class AppModel: ObservableObject, MediaSessionModel {
         // username for convenience; clear the password.
         Keychain.delete()
         password = ""
+        // Forget the last-played station too: it belongs to this account,
+        // and the next person to log in shouldn't be auto-started into it
+        // (issue #4).
+        lastStation.save(nil)
         status = "Logged out."
     }
 
@@ -241,10 +264,48 @@ final class AppModel: ObservableObject, MediaSessionModel {
 
     private func playIfAvailable() {
         if let url = currentSong?.audioUrl, let u = URL(string: url) {
+            // A song is starting from this station — remember it as the
+            // most recently played so the app can restore it on launch
+            // (issue #4).
+            if let id = selectedStation?.stableId {
+                lastStation.save(id)
+            }
             player.play(url: u)
             updateNowPlaying()
         } else if currentSong != nil {
             status = "This song has no audio URL."
+        }
+    }
+
+    /// Start (or restart) a song on the currently selected station. Used
+    /// for issue #4's auto-play: on launch, after a station is created, or
+    /// when the user picks a station while paused. Fetches the playlist
+    /// (so there is always a song to play) and starts it.
+    private func autoPlayFirstSongIfNeeded() async throws {
+        guard let station = selectedStation else { return }
+        let songs = try await client?.getPlaylist(station: station) ?? []
+        playlist = songs
+        showUpcoming = false
+        playIfAvailable()
+    }
+
+    /// Called when the user picks a station in the station bar (issue #4).
+    /// Always reflects the choice; and when nothing is playing (paused or
+    /// no song yet), starts a song from the newly selected station. While a
+    /// song is playing we leave it running — switching stations mid-song is
+    /// a deliberate "pause + switch" the user can act on.
+    func stationDidSelect(_ id: String?) {
+        selectedStationID = id
+        guard let id,
+              stations.contains(where: { $0.stableId == id }),
+              player.isPlaying == false
+        else { return }
+        Task { @MainActor in
+            do {
+                try await self.autoPlayFirstSongIfNeeded()
+            } catch {
+                self.status = "Couldn't start music: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -487,6 +548,10 @@ final class AppModel: ObservableObject, MediaSessionModel {
             if let newStation = self.stations.last {
                 self.selectedStationID = newStation.stableId
             }
+            // Start music from the new station — the user just created and
+            // selected it, and nothing is playing yet (issue #4). The play
+            // also records it as the most recently played station.
+            try await self.autoPlayFirstSongIfNeeded()
             self.searchResult = nil
             self.status = "Station \"\(name)\" created."
         }
@@ -656,7 +721,10 @@ struct ContentView: View {
 
     private var stationBar: some View {
         HStack {
-            Picker("Station", selection: $model.selectedStationID) {
+            Picker("Station", selection: Binding(
+            get: { model.selectedStationID },
+            set: { model.stationDidSelect($0) }
+        )) {
                 Text("—").tag(String?.none)
                 ForEach(model.stations) { s in
                     Text(s.name ?? s.stableId).tag(Optional(s.stableId))
