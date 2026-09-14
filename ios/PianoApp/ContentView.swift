@@ -74,6 +74,15 @@ final class AppModel: ObservableObject, MediaSessionModel {
         playerCancellable = player.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        // When a song finishes playing naturally, fetch and start the next
+        // one from the current station (issue #16). The callback fires on
+        // the main thread; the model is main-actor isolated.
+        player.onSongFinished = { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.nextSong()
+            }
+        }
         media = MediaSession(model: self)
         // Restore saved credentials and log in automatically, so the user
         // doesn't have to re-enter them on every launch. (If the login
