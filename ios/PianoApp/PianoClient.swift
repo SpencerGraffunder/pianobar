@@ -529,12 +529,6 @@ final class PianoClient {
         try await call(PIANO_REQUEST_SET_QUICKMIX, data: nil)
     }
 
-    /// Bookmark the current song ("add to my library").
-    func bookmark(_ song: Song) async throws {
-        try await call(PIANO_REQUEST_BOOKMARK_SONG,
-                       data: UnsafeMutableRawPointer(song.raw))
-    }
-
     /// Rename the selected station.
     func renameStation(_ station: Station, newName: String) async throws {
         let n = cCopy(newName)
