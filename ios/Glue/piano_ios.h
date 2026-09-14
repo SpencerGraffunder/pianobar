@@ -34,6 +34,14 @@ void PianoIosCreateStationFromSong (PianoRequestDataCreateStation_t *d);
 void PianoIosCreateStationFromArtist (PianoRequestDataCreateStation_t *d);
 void PianoIosCreateStationFromMusicToken (PianoRequestDataCreateStation_t *d);
 
+/* Toggle the QuickMix selection across all non-QuickMix stations: include
+ * all if none were included, include none if any were. Operates on the
+ * handle's authoritative station list, so it is safe regardless of any
+ * Swift-side station snapshot. Call this before PIANO_REQUEST_SET_QUICKMIX
+ * (whose request builder reads each station's useQuickMix flag).
+ * Returns 1 if all non-QuickMix stations are now included, 0 otherwise. */
+int PianoIosToggleQuickMix (PianoHandle_t *ph);
+
 #ifdef __cplusplus
 }
 #endif

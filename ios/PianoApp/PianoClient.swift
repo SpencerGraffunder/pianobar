@@ -508,6 +508,18 @@ final class PianoClient {
         }
     }
 
+    /// Toggle the QuickMix inclusion for all non-QuickMix stations: include
+    /// all if none were included, include none if any were. The C helper
+    /// (PianoIosToggleQuickMix) operates on the core's authoritative station
+    /// list, so this is safe even if the Swift-side station snapshot is stale
+    /// — it never writes through Swift-held raw pointers. Call this before
+    /// `setQuickMix()` to apply the selection.
+    /// Returns true if the non-QuickMix stations are now all included.
+    @discardableResult
+    func toggleQuickMixSelection() -> Bool {
+        PianoIosToggleQuickMix(handle) != 0
+    }
+
     /// Register which stations are included in the current QuickMix station's
     /// playlist. No per-station data: the core reads each station's
     /// `useQuickMix` flag (request.c SET_QUICKMIX builds quickMixStationIds).

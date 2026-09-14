@@ -414,18 +414,15 @@ final class AppModel: ObservableObject, MediaSessionModel {
             status = "The current station is not a QuickMix station."
             return
         }
-        // On/off: if any station is currently included, turn all off, else
-        // include every non-quickmix station.
-        let anyOn = stations.contains { $0.useQuickMix }
-        let include: Int8 = anyOn ? 0 : 1
-        run("Quick Mix") { [weak self] in
+        // Toggle in C (include all if none are included, clear all if any
+        // are), then apply the selection on the server.
+        run("Select Stations") { [weak self] in
             guard let self else { return }
-            for s in self.stations where !s.isQuickMix {
-                s.raw.pointee.useQuickMix = include
-            }
+            // Set the selection in C (operates on the core's authoritative
+            // station list — no Swift-held raw pointers), then tell the
+            // server. This is what makes it work without crashing.
+            let included = client.toggleQuickMixSelection()
             try await client.setQuickMix()
-            self.status = anyOn ? "QuickMix stations cleared."
-                : "QuickMix includes all stations."
             // Pick up the new mix.
             if let st = self.selectedStation {
                 let songs = try await client.getPlaylist(station: st)
@@ -433,6 +430,8 @@ final class AppModel: ObservableObject, MediaSessionModel {
                 self.showUpcoming = false
                 self.playIfAvailable()
             }
+            self.status = included ? "All stations included in QuickMix."
+                : "QuickMix cleared."
         }
     }
 
@@ -732,8 +731,10 @@ struct ContentView: View {
             .init(id: "delete", title: "Delete", systemImage: "trash",
                   role: .normal, enabled: hasStation,
                   action: { model.confirmDelete = true }),
-            .init(id: "quickmix", title: "Quick Mix", systemImage: "shuffle",
-                  role: .normal, enabled: hasStation, action: model.toggleQuickMix),
+            .init(id: "quickmix", title: "Select Stations", systemImage: "shuffle",
+                  role: .normal,
+                  enabled: hasStation && model.selectedStation?.isQuickMix == true,
+                  action: model.toggleQuickMix),
             .init(id: "device", title: "Device", systemImage: "hifispeaker",
                   role: .normal, enabled: true,
                   action: { model.showDevicePicker = true }),
