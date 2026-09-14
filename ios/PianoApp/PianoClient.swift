@@ -69,30 +69,50 @@ struct Station: Identifiable, Hashable {
     func hash(into h: inout Hasher) { h.combine(UnsafeRawPointer(raw)) }
 }
 
-/// A song from the current playlist. The C struct stays valid until the
-/// next `getPlaylist` call or client deinit.
+/// A song from the current playlist.
+///
+/// A **value copy**, safe to store: the fields are read out of the C
+/// `PianoSong_t` at creation time, so the value outlives the C playlist.
+/// This matters because every `getPlaylist` call frees the *previous*
+/// C playlist (the core owns it), so keeping C pointers into a playlist
+/// is a use-after-free the instant the next playlist is fetched — the
+/// exact crash from switching stations mid-playback and tapping Next.
+///
+/// The C core only reads `stationId` and `trackToken` from a song
+/// (rate / tired / explain / bookmark), and both are copied here.
 struct Song: Identifiable, Hashable {
-    let raw: UnsafeMutablePointer<PianoSong>
+    var artist: String?
+    var title: String?
+    var album: String?
+    var audioUrl: String?
+    var musicId: String?
+    var trackToken: String?
+    var stationId: String?
+    var seedId: String?
+    var detailUrl: String?
+    var coverArt: String?
+    var length: UInt32
+    var rating: PianoSongRating_t
+    var audioFormat: PianoAudioFormat_t
 
-    var artist: String? { cstr(raw.pointee.artist) }
-    var title: String? { cstr(raw.pointee.title) }
-    var album: String? { cstr(raw.pointee.album) }
-    var audioUrl: String? { cstr(raw.pointee.audioUrl) }
-    var musicId: String? { cstr(raw.pointee.musicId) }
-    var trackToken: String? { cstr(raw.pointee.trackToken) }
-    var stationId: String? { cstr(raw.pointee.stationId) }
-    var seedId: String? { cstr(raw.pointee.seedId) }
-    var detailUrl: String? { cstr(raw.pointee.detailUrl) }
-    var coverArt: String? { cstr(raw.pointee.coverArt) }
-    var length: UInt32 { raw.pointee.length }
-    var rating: PianoSongRating_t { raw.pointee.rating }
-    var audioFormat: PianoAudioFormat_t { raw.pointee.audioFormat }
-
-    var stableId: String { trackToken ?? musicId ?? "\(raw)" }
+    var stableId: String { trackToken ?? musicId ?? title ?? "song" }
     var id: String { stableId }
 
-    static func == (l: Song, r: Song) -> Bool { l.raw == r.raw }
-    func hash(into h: inout Hasher) { h.combine(UnsafeRawPointer(raw)) }
+    init(_ s: PianoSong) {
+        artist = cstr(s.artist)
+        title = cstr(s.title)
+        album = cstr(s.album)
+        audioUrl = cstr(s.audioUrl)
+        musicId = cstr(s.musicId)
+        trackToken = cstr(s.trackToken)
+        stationId = cstr(s.stationId)
+        seedId = cstr(s.seedId)
+        detailUrl = cstr(s.detailUrl)
+        coverArt = cstr(s.coverArt)
+        length = s.length
+        rating = s.rating
+        audioFormat = s.audioFormat
+    }
 }
 
 /// A search-result artist (value copy; safe to store).
@@ -192,6 +212,25 @@ final class PianoClient {
             }
         }
         return buf
+    }
+
+    /// Build a transient C `PianoSong_t` from a `Song` value, providing
+    /// exactly the fields the core reads for a song (stationId + trackToken,
+    /// used by rate / tired / explain / bookmark). The caller owns the result
+    /// and releases it with `freeCSong` once the request has finished.
+    private func makeCSong(_ song: Song) -> UnsafeMutablePointer<PianoSong> {
+        let s = UnsafeMutablePointer<PianoSong>.allocate(capacity: 1)
+        memset(s, 0, MemoryLayout<PianoSong>.stride)
+        if let t = song.trackToken { s.pointee.trackToken = cCopy(t) }
+        if let sid = song.stationId { s.pointee.stationId = cCopy(sid) }
+        return s
+    }
+
+    /// Release a `PianoSong_t` made by `makeCSong`.
+    private func freeCSong(_ s: UnsafeMutablePointer<PianoSong>) {
+        if let t = s.pointee.trackToken { free(t) }
+        if let sid = s.pointee.stationId { free(sid) }
+        s.deallocate()
     }
 
     /// Run one core request with a heap-allocated data struct.
@@ -412,7 +451,7 @@ final class PianoClient {
         var result: [Song] = []
         var cur = playlist
         while let s = cur {
-            result.append(Song(raw: s))
+            result.append(Song(s.pointee))
             cur = s.pointee.head.next.map {
                 UnsafeMutableRawPointer($0).assumingMemoryBound(to: PianoSong.self)
             }
@@ -422,17 +461,21 @@ final class PianoClient {
 
     /// Love / ban the current song.
     func rateSong(_ song: Song, rating: PianoSongRating_t) async throws {
+        let cs = makeCSong(song)
+        defer { freeCSong(cs) }
         try await runData(PIANO_REQUEST_RATE_SONG) {
             (d: UnsafeMutablePointer<PianoRequestDataRateSong_t>) in
-            d.pointee.song = song.raw
+            d.pointee.song = cs
             d.pointee.rating = rating
         }
     }
 
     /// Mark the current song as "tired" (sleep for a month).
     func markTired(_ song: Song) async throws {
+        let cs = makeCSong(song)
+        defer { freeCSong(cs) }
         try await call(PIANO_REQUEST_ADD_TIRED_SONG,
-                       data: UnsafeMutableRawPointer(song.raw))
+                       data: UnsafeMutableRawPointer(cs))
     }
 
     /// Search for artists and songs. Results are copied to Swift values
@@ -519,8 +562,10 @@ final class PianoClient {
 
     /// Bookmark the current song ("add to my library").
     func bookmark(_ song: Song) async throws {
+        let cs = makeCSong(song)
+        defer { freeCSong(cs) }
         try await call(PIANO_REQUEST_BOOKMARK_SONG,
-                       data: UnsafeMutableRawPointer(song.raw))
+                       data: UnsafeMutableRawPointer(cs))
     }
 
     /// Rename the selected station.
@@ -545,10 +590,12 @@ final class PianoClient {
     /// explanation (may be empty if the server has none).
     func explain(_ song: Song) async throws -> String {
         var out = ""
+        let cs = makeCSong(song)
+        defer { freeCSong(cs) }
         try await runData(
             PIANO_REQUEST_EXPLAIN,
             setup: { (d: UnsafeMutablePointer<PianoRequestDataExplain_t>) in
-                d.pointee.song = song.raw
+                d.pointee.song = cs
                 d.pointee.retExplain = nil
             },
             finish: { (d: UnsafeMutablePointer<PianoRequestDataExplain_t>) in
