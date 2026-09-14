@@ -348,18 +348,6 @@ final class AppModel: ObservableObject, MediaSessionModel {
         }
     }
 
-    func bookmarkSong() {
-        guard let client = client, let song = currentSong else {
-            status = "Play a song first."
-            return
-        }
-        run("Bookmarking") { [weak self] in
-            guard let self else { return }
-            try await client.bookmark(song)
-            self.status = "Bookmarked."
-        }
-    }
-
     func toggleUpcoming() {
         showUpcoming.toggle()
     }
@@ -722,8 +710,6 @@ struct ContentView: View {
                   action: model.markTired),
             .init(id: "explain", title: "Explain", systemImage: "questionmark.circle",
                   role: .normal, enabled: hasSong, action: model.explainSong),
-            .init(id: "bookmark", title: "Bookmark", systemImage: "bookmark.fill",
-                  role: .normal, enabled: hasSong, action: model.bookmarkSong),
             .init(id: "addseed", title: "Add Music", systemImage: "plus.circle",
                   role: .normal, enabled: hasStation,
                   action: { model.showAddSearch = true }),
