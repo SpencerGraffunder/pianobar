@@ -73,18 +73,13 @@ enum SongSaver {
     /// count. Pure URL→URL: testable with locally generated audio.
     static func transcode(input: URL, output: URL) async throws {
         let asset = AVURLAsset(url: input)
-        guard let tracks = try await asset.loadTracks(withMediaType: .audio),
-              let track = tracks.first else {
+        guard let track = asset.tracks(withMediaType: .audio).first,
+              let desc = track.format,
+              let src = AVAudioFormat(settingsFromDescription: desc),
+              src.sampleRate > 0, src.channelCount > 0 else {
             throw NSError(domain: "SongSaver", code: 4,
                           userInfo: [NSLocalizedDescriptionKey:
-                               "No audio track to transcode"])
-        }
-        let desc = try await track.load(.format)
-        guard let src = AVAudioFormat(settingsFromDescription: desc),
-              src.sampleRate > 0, src.channelCount > 0 else {
-            throw NSError(domain: "SongSaver", code: 5,
-                          userInfo: [NSLocalizedDescriptionKey:
-                               "Unsupported audio source format"])
+                               "No transcodable audio track"])
         }
 
         // Decode to 16-bit linear PCM at the source's native rate/width.
@@ -106,7 +101,7 @@ enum SongSaver {
 
         let reader = try AVAssetReader(asset: asset)
         let readerOutput = AVAssetReaderTrackOutput(
-            track: track, settings: inSettings)
+            track: track, outputSettings: inSettings)
         readerOutput.alwaysCopiesSampleData = false
         reader.add(readerOutput)
 
@@ -123,15 +118,17 @@ enum SongSaver {
                            userInfo: [NSLocalizedDescriptionKey:
                                 "Failed to start transcode"])
         }
-        writer.startSession(atSourceTime: reader.currentReadTimestamp)
+        writer.startSession(atSourceTime: reader.currentTime)
 
         while reader.status == .reading {
             guard let sample = readerOutput.copyNextSampleBuffer()
             else { break }
             while !writerInput.isReadyForMoreMediaData {
+                if writer.status == .failed { break }  // don't spin forever
                 try await Task.sleep(nanoseconds: 10_000_000)  // 10 ms
             }
-            writerInput.append(sampleBuffer: sample)
+            guard writerInput.isReadyForMoreMediaData else { break }
+            writerInput.append(sample)
         }
         let readerError = reader.status == .failed ? reader.error : nil
         writerInput.markAsFinished()
