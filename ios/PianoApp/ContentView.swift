@@ -64,8 +64,6 @@ final class AppModel: ObservableObject, MediaSessionModel {
 
     /// A saved .m4a ready to share (Music / Files / …).
     @Published var shareItem: ShareItem?
-    /// Device-picker sheet (stock iOS output picker).
-    @Published var showDevicePicker = false
     /// Help sheet (explains every button).
     @Published var showHelp = false
 
@@ -589,6 +587,10 @@ private struct Control: Identifiable {
     let systemImage: String
     let role: Role
     let enabled: Bool
+    /// When true, the tile renders the stock iOS output picker inline
+    /// (speaker / headphones / Bluetooth / AirPlay) instead of an SF Symbol,
+    /// and the picker button itself owns the tap.
+    var isDevicePicker: Bool = false
     let action: () -> Void
 }
 
@@ -700,9 +702,6 @@ struct ContentView: View {
         .sheet(isPresented: $model.showAddSearch) {
             AddMusicSheet(model: model)
         }
-        .sheet(isPresented: $model.showDevicePicker) {
-            DevicePickerSheet()
-        }
         .sheet(isPresented: $model.showHelp) {
             HelpSheet()
         }
@@ -799,8 +798,8 @@ struct ContentView: View {
                   enabled: hasStation && model.selectedStation?.isQuickMix == true,
                   action: model.toggleQuickMix),
             .init(id: "device", title: "Device", systemImage: "hifispeaker",
-                  role: .normal, enabled: true,
-                  action: { model.showDevicePicker = true }),
+                  role: .normal, enabled: true, isDevicePicker: true,
+                  action: {}),
             .init(id: "save", title: "Save", systemImage: "square.and.arrow.down",
                   role: .normal,
                   enabled: hasSong && model.currentSong?.audioUrl != nil,
@@ -812,19 +811,45 @@ struct ContentView: View {
 
         return LazyVGrid(columns: columns, spacing: 10) {
             ForEach(controls) { c in
-                Button(action: c.action) {
+                if c.isDevicePicker {
+                    // Native iOS output picker, inline on the main screen.
+                    // No SwiftUI Button wrapper — that would swallow the tap.
+                    // A VStack is a plain layout container, so the embedded
+                    // route button (speaker icon) keeps its own hit-testing
+                    // and opens the system sheet (speaker / headphones /
+                    // Bluetooth / AirPlay) when tapped.
                     VStack(spacing: 6) {
-                        Image(systemName: c.systemImage)
-                            .font(.system(size: 20, weight: .semibold))
+                        DevicePickerButton()
+                            .frame(width: 30, height: 30)
                         Text(c.title)
                             .font(.subheadline.weight(.medium))
                             .lineLimit(1)
                             .minimumScaleFactor(0.8)
                     }
                     .frame(maxWidth: .infinity, minHeight: 62)
+                    .background(Color(.secondarySystemBackground),
+                                in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color(.separator).opacity(0.4),
+                                          lineWidth: 1)
+                    )
+                    .disabled(model.isWorking)
+                } else {
+                    Button(action: c.action) {
+                        VStack(spacing: 6) {
+                            Image(systemName: c.systemImage)
+                                .font(.system(size: 20, weight: .semibold))
+                            Text(c.title)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 62)
+                    }
+                    .buttonStyle(GridButtonStyle(role: c.role))
+                    .disabled(!c.enabled || model.isWorking)
                 }
-                .buttonStyle(GridButtonStyle(role: c.role))
-                .disabled(!c.enabled || model.isWorking)
             }
         }
     }
@@ -1085,9 +1110,10 @@ struct ShareItem: Identifiable {
     var id: String { url.absoluteString }
 }
 
-/// A button showing the stock iOS route button (speaker icon). Tapping
-/// it opens the system output picker (speaker / headphones / Bluetooth /
-/// AirPlay) — the same picker the volume HUD shows in other apps.
+/// A stock iOS route button (speaker icon). Tapping it opens the system
+/// output picker (speaker / headphones / Bluetooth / AirPlay) — the same
+/// picker the volume HUD shows in other apps. Rendered inline in the
+/// Device tile on the main screen (no popup sheet).
 struct DevicePickerButton: UIViewRepresentable {
     func makeUIView(context: Context) -> MPVolumeView {
         let v = MPVolumeView()
@@ -1098,30 +1124,6 @@ struct DevicePickerButton: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MPVolumeView, context: Context) {}
-}
-
-/// Sheet with the stock output picker (the system AirPlay/output button
-/// from `MPVolumeView` — tapping it opens the stock picker listing
-/// speaker, headphones, Bluetooth, and AirPlay targets).
-struct DevicePickerSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Play through…")
-                .font(.headline)
-            DevicePickerButton()
-                .frame(width: 64, height: 64)
-            Text("Tap the speaker button to open the system picker\n(speaker, headphones, Bluetooth, AirPlay).")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Spacer()
-            Button("Done") { dismiss() }
-                .buttonStyle(.bordered)
-        }
-        .padding(24)
-    }
 }
 
 // MARK: - Share sheet (saved song → Music / Files / …)
