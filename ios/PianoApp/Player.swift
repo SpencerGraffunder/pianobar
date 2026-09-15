@@ -25,6 +25,11 @@ final class Player: ObservableObject {
     private var statusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
 
+    /// Invoked on the main thread when the current item finishes playing
+    /// naturally (end of stream). The owning model (AppModel) sets this to
+    /// fetch and start the next song (issue #16). Nil if no one is watching.
+    var onSongFinished: (() -> Void)?
+
     init() {
         try? AVAudioSession.sharedInstance()
             .setCategory(.playback, mode: .default)
@@ -56,6 +61,9 @@ final class Player: ObservableObject {
             forName: .AVPlayerItemDidPlayToEndTime, object: item,
             queue: .main) { [weak self] _ in
             self?.isPlaying = false
+            // The song finished: let the owner advance to the next one
+            // (issue #16 — previously playback just stopped here).
+            self?.onSongFinished?()
         }
     }
 
