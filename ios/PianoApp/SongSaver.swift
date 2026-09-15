@@ -11,6 +11,16 @@
 // The transcode core (`transcode`) is pure (URL → URL) and fully
 // unit-testable offline.
 //
+// Why not AVAssetExportSession (the previous implementation)?
+// Pandora serves the high-quality stream as HE-AAC (AAC+ with SBR) —
+// the same codec AVPlayer decodes fine for playback (see Player.swift).
+// But AVAssetExportSession cannot ingest HE-AAC: it fails with
+// CoreMedia -3840 ("The operation couldn't be completed"), which is
+// exactly what the Save button reported (issue #23). The
+// AVAssetReader/AVAssetWriter path below *decodes* any supported
+// source (HE-AAC, MP3, plain AAC, PCM) to linear PCM and re-encodes
+// to AAC, so it works for every quality tier.
+//
 // Copyright (c) 2025 Spencer Graffunder
 // MIT licensed.
 //
@@ -51,32 +61,88 @@ enum SongSaver {
         if FileManager.default.fileExists(atPath: out.path) {
             try FileManager.default.removeItem(at: out)
         }
-        try await transcode(
-            input: raw, output: out,
-            preset: AVAssetExportPresetAppleM4A)
+        try await transcode(input: raw, output: out)
         return out
     }
 
-    /// Transcode `input` to `output` using the given AVAssetExportSession
-    /// preset name (e.g. `AVAssetExportPresetAppleM4A`).
-    /// Pure URL→URL: testable with locally generated audio.
-    static func transcode(input: URL, output: URL,
-                          preset: String) async throws {
+    /// Transcode `input` to `output` as AAC in an .m4a container.
+    ///
+    /// Decodes the source's first audio track (HE-AAC / MP3 / AAC /
+    /// PCM — anything AVFoundation can decode) to 16-bit linear PCM,
+    /// then re-encodes to AAC at the source's sample rate and channel
+    /// count. Pure URL→URL: testable with locally generated audio.
+    static func transcode(input: URL, output: URL) async throws {
         let asset = AVURLAsset(url: input)
-        guard let session = AVAssetExportSession(
-            asset: asset, presetName: preset) else {
-            throw NSError(domain: "SongSaver", code: 3,
+        guard let tracks = try await asset.loadTracks(withMediaType: .audio),
+              let track = tracks.first else {
+            throw NSError(domain: "SongSaver", code: 4,
                           userInfo: [NSLocalizedDescriptionKey:
-                               "Unsupported export preset: \(preset)"])
+                               "No audio track to transcode"])
         }
-        session.outputURL = output
-        session.outputFileType = .m4a
-        await session.export()
-        guard session.status == .completed else {
-            throw session.error
-                ?? NSError(domain: "SongSaver", code: 1,
+        let desc = try await track.load(.format)
+        guard let src = AVAudioFormat(settingsFromDescription: desc),
+              src.sampleRate > 0, src.channelCount > 0 else {
+            throw NSError(domain: "SongSaver", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey:
+                               "Unsupported audio source format"])
+        }
+
+        // Decode to 16-bit linear PCM at the source's native rate/width.
+        let inSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: false,
+            AVSampleRateKey: src.sampleRate,
+            AVNumberOfChannelsKey: src.channelCount,
+        ]
+        // Re-encode to AAC (128 kbps) in an .m4a container.
+        let outSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: src.sampleRate,
+            AVNumberOfChannelsKey: src.channelCount,
+            AVEncoderBitRateKey: 128_000,
+        ]
+
+        let reader = try AVAssetReader(asset: asset)
+        let readerOutput = AVAssetReaderTrackOutput(
+            track: track, settings: inSettings)
+        readerOutput.alwaysCopiesSampleData = false
+        reader.add(readerOutput)
+
+        let writer = try AVAssetWriter(
+            outputURL: output, fileType: .m4a)
+        let writerInput = AVAssetWriterInput(
+            mediaType: .audio, outputSettings: outSettings)
+        writerInput.expectsMediaDataInRealTime = false
+        writer.add(writerInput)
+
+        guard reader.startReading(), writer.startWriting() else {
+            throw reader.error ?? writer.error
+                ?? NSError(domain: "SongSaver", code: 6,
                            userInfo: [NSLocalizedDescriptionKey:
-                                "Transcode failed (status \(session.status.rawValue))"])
+                                "Failed to start transcode"])
+        }
+        writer.startSession(atSourceTime: reader.currentReadTimestamp)
+
+        while reader.status == .reading {
+            guard let sample = readerOutput.copyNextSampleBuffer()
+            else { break }
+            while !writerInput.isReadyForMoreMediaData {
+                try await Task.sleep(nanoseconds: 10_000_000)  // 10 ms
+            }
+            writerInput.append(sampleBuffer: sample)
+        }
+        let readerError = reader.status == .failed ? reader.error : nil
+        writerInput.markAsFinished()
+        await writer.finishWriting()
+
+        if let readerError { throw readerError }
+        guard writer.status == .completed else {
+            throw writer.error
+                ?? NSError(domain: "SongSaver", code: 7,
+                           userInfo: [NSLocalizedDescriptionKey:
+                                "Transcode failed (status \(writer.status.rawValue))"])
         }
         guard FileManager.default.fileExists(atPath: output.path) else {
             throw NSError(domain: "SongSaver", code: 2,
