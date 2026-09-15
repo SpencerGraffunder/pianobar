@@ -19,6 +19,9 @@ final class Player: ObservableObject {
     @Published private(set) var isPlaying = false
     /// Set when the current item fails to load/play; cleared on a new play.
     @Published private(set) var lastError: String?
+    /// Set when the current item reached its end. Cleared on a new play.
+    /// Used to tell "resume a paused song" from "restart an ended one".
+    @Published private(set) var itemFinished = false
     @Published var volume: Float = 0.8
 
     private var player: AVPlayer?
@@ -56,6 +59,7 @@ final class Player: ObservableObject {
             forName: .AVPlayerItemDidPlayToEndTime, object: item,
             queue: .main) { [weak self] _ in
             self?.isPlaying = false
+            self?.itemFinished = true
         }
     }
 
@@ -70,6 +74,7 @@ final class Player: ObservableObject {
         player = newPlayer
         observe(item)
         lastError = nil
+        itemFinished = false
         newPlayer.play()
         isPlaying = true
     }
@@ -108,6 +113,22 @@ final class Player: ObservableObject {
         guard let d = player?.currentItem?.duration, d.seconds.isFinite,
               d.seconds > 0 else { return 0 }
         return d.seconds
+    }
+
+    /// True only when AVPlayer is *actually* producing audio right now
+    /// (not just when we asked it to). Drives the Now Playing transport
+    /// icon: publishing `playbackRate` from intent instead of reality is
+    /// what made the Control Center icon flicker while the stream buffered.
+    var isActivelyPlaying: Bool {
+        player?.timeControlStatus == .playing
+    }
+
+    /// A song is loaded that can be resumed (not yet finished, and we
+    /// haven't torn the player down). Lets the model resume from a
+    /// lock-screen/Control-Center Play instead of restarting from 0:00.
+    var canResume: Bool {
+        guard let p = player, !itemFinished else { return false }
+        return p.currentItem != nil
     }
 
     /// Resume the current item (used by media-session auto-resume).
