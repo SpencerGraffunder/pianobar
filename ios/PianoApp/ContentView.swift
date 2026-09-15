@@ -66,6 +66,11 @@ final class AppModel: ObservableObject, MediaSessionModel {
     @Published var shareItem: ShareItem?
     /// Device-picker sheet (stock iOS output picker).
     @Published var showDevicePicker = false
+    /// "Select stations" (QuickMix) sheet (issue #24): a checkmark list of
+    /// the non-QuickMix stations the user wants included in the mix.
+    @Published var showStationSelect = false
+    /// Station ids (stableId) currently checked in that sheet.
+    @Published var quickMixPicked: Set<String> = []
 
     private var client: PianoClient?
     private var working = false
@@ -403,31 +408,56 @@ final class AppModel: ObservableObject, MediaSessionModel {
         }
     }
 
-    // MARK: Quick mix
+    // MARK: Quick mix / station selection (issue #24)
 
-    func toggleQuickMix() {
-        guard let client = client, let station = selectedStation else {
-            status = "Pick a station first."
+    /// Stations eligible for the QuickMix include list (everything except the
+    /// QuickMix station itself).
+    var stationSelectList: [Station] {
+        stations.filter { !$0.isQuickMix }
+    }
+
+    /// Open the "Select stations" sheet (issue #24). Tapping Quick Mix now
+    /// shows a checkmark list instead of blindly toggling everything on/off
+    /// — the old behavior sent an empty mix list to Pandora on the first tap
+    /// (which it rejected with "no error message available") and then always
+    /// skipped to the next song.
+    func openStationSelect() {
+        quickMixPicked = Set(
+            stations.filter { $0.useQuickMix && !$0.isQuickMix }
+                .map { $0.stableId })
+        showStationSelect = true
+    }
+
+    /// Apply the checked station set: register it with Pandora, then refresh
+    /// the playlist only if the currently-playing song is NOT from one of the
+    /// selected stations (per issue #24). An empty selection is rejected
+    /// locally because it is the root of the first-tap error.
+    func applyStationSelect() {
+        let picked = quickMixPicked
+        showStationSelect = false
+        guard !picked.isEmpty else {
+            status = "Select at least one station to include."
             return
         }
-        guard station.isQuickMix else {
-            status = "The current station is not a QuickMix station."
+        guard let client = client else {
+            status = "Log in first."
             return
         }
-        // On/off: if any station is currently included, turn all off, else
-        // include every non-quickmix station.
-        let anyOn = stations.contains { $0.useQuickMix }
-        let include: Int8 = anyOn ? 0 : 1
-        run("Quick Mix") { [weak self] in
+        let included: Set<String> = picked
+        run("Select stations") { [weak self] in
             guard let self else { return }
+            // Mirror the checkmark set onto the C core's useQuickMix flags so
+            // setQuickMix() sends exactly the included non-QuickMix stations.
             for s in self.stations where !s.isQuickMix {
-                s.raw.pointee.useQuickMix = include
+                s.raw.pointee.useQuickMix = included.contains(s.stableId) ? 1 : 0
             }
             try await client.setQuickMix()
-            self.status = anyOn ? "QuickMix stations cleared."
-                : "QuickMix includes all stations."
-            // Pick up the new mix.
-            if let st = self.selectedStation {
+            self.status = "Stations updated: \(included.count) included."
+            // Only skip to a new song if the current one is from a station the
+            // user just excluded. If it's still included, keep playing it.
+            let currentStationId = self.currentSong?.stationId
+            let keepPlaying = currentStationId.map { included.contains($0) } ?? false
+            if !keepPlaying, let st = self.selectedStation {
                 let songs = try await client.getPlaylist(station: st)
                 self.playlist = songs
                 self.showUpcoming = false
@@ -642,6 +672,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.showDevicePicker) {
             DevicePickerSheet()
         }
+        .sheet(isPresented: $model.showStationSelect) {
+            StationSelectSheet(model: model)
+        }
         .sheet(item: $model.shareItem) { ShareSheet(url: $0.url) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -732,8 +765,8 @@ struct ContentView: View {
             .init(id: "delete", title: "Delete", systemImage: "trash",
                   role: .normal, enabled: hasStation,
                   action: { model.confirmDelete = true }),
-            .init(id: "quickmix", title: "Quick Mix", systemImage: "shuffle",
-                  role: .normal, enabled: hasStation, action: model.toggleQuickMix),
+            .init(id: "quickmix", title: "Select Stations", systemImage: "shuffle",
+                  role: .normal, enabled: hasStation, action: model.openStationSelect),
             .init(id: "device", title: "Device", systemImage: "hifispeaker",
                   role: .normal, enabled: true,
                   action: { model.showDevicePicker = true }),
@@ -878,6 +911,71 @@ struct AddMusicSheet: View {
         }
         .presentationDetents([.medium, .large])
         .onAppear { focused = true }
+    }
+}
+
+// MARK: - Select stations sheet (QuickMix include list, issue #24)
+
+/// Checkmark list of the stations to include in the current QuickMix station,
+/// with a Done button. Presented by the "Select Stations" button. Replaces the
+/// old blind all-on/all-off QuickMix toggle (which sent an empty mix list to
+/// Pandora on the first tap and always skipped the current song).
+struct StationSelectSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var list: [Station] { model.stationSelectList }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Choose which stations to include in this mix.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                if list.isEmpty {
+                    Text("There are no other stations to include.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(list) { s in
+                        Button {
+                            if model.quickMixPicked.contains(s.stableId) {
+                                model.quickMixPicked.remove(s.stableId)
+                            } else {
+                                model.quickMixPicked.insert(s.stableId)
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName:
+                                    model.quickMixPicked.contains(s.stableId)
+                                    ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(
+                                        model.quickMixPicked.contains(s.stableId)
+                                        ? Color.accentColor : Color.secondary)
+                                Text(s.name ?? s.stableId)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Select Stations")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { model.applyStationSelect() }
+                        .disabled(model.quickMixPicked.isEmpty || model.isWorking)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }
 
