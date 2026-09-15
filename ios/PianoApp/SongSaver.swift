@@ -68,34 +68,34 @@ enum SongSaver {
     /// Transcode `input` to `output` as AAC in an .m4a container.
     ///
     /// Decodes the source's first audio track (HE-AAC / MP3 / AAC /
-    /// PCM — anything AVFoundation can decode) to 16-bit linear PCM,
-    /// then re-encodes to AAC at the source's sample rate and channel
-    /// count. Pure URL→URL: testable with locally generated audio.
+    /// PCM — anything AVFoundation can decode) to 16-bit linear PCM at
+    /// 44.1 kHz stereo, then re-encodes to AAC 128 kbps in an .m4a.
+    /// Pure URL→URL: testable with locally generated audio.
     static func transcode(input: URL, output: URL) async throws {
         let asset = AVURLAsset(url: input)
-        guard let track = asset.tracks(withMediaType: .audio).first,
-              let desc = track.format,
-              let src = AVAudioFormat(settingsFromDescription: desc),
-              src.sampleRate > 0, src.channelCount > 0 else {
+        guard let track = asset.tracks(withMediaType: .audio).first else {
             throw NSError(domain: "SongSaver", code: 4,
                           userInfo: [NSLocalizedDescriptionKey:
                                "No transcodable audio track"])
         }
 
-        // Decode to 16-bit linear PCM at the source's native rate/width.
+        // Decode the source (HE-AAC / MP3 / AAC / PCM) to a fixed, known
+        // PCM target: 44.1 kHz, stereo, 16-bit. The reader does the decode
+        // + resample + channel mixdown to this format, so the writer input
+        // is always compatible regardless of the source's native layout.
         let inSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsFloatKey: false,
-            AVSampleRateKey: src.sampleRate,
-            AVNumberOfChannelsKey: src.channelCount,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 2,
         ]
-        // Re-encode to AAC (128 kbps) in an .m4a container.
+        // Re-encode the decoded PCM to AAC (128 kbps) in an .m4a container.
         let outSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: src.sampleRate,
-            AVNumberOfChannelsKey: src.channelCount,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 2,
             AVEncoderBitRateKey: 128_000,
         ]
 
@@ -118,7 +118,7 @@ enum SongSaver {
                            userInfo: [NSLocalizedDescriptionKey:
                                 "Failed to start transcode"])
         }
-        writer.startSession(atSourceTime: reader.currentTime)
+        writer.startSession(atSourceTime: .zero)
 
         while reader.status == .reading {
             guard let sample = readerOutput.copyNextSampleBuffer()
