@@ -64,20 +64,33 @@ final class AppModel: ObservableObject, MediaSessionModel {
 
     /// A saved .m4a ready to share (Music / Files / …).
     @Published var shareItem: ShareItem?
-    /// Device-picker sheet (stock iOS output picker).
-    @Published var showDevicePicker = false
-    /// "Select stations" (QuickMix) sheet (issue #24): a checkmark list of
-    /// the non-QuickMix stations the user wants included in the mix.
+    /// Help sheet (explains every button).
+    @Published var showHelp = false
+    /// "Select stations" (QuickMix) sheet (issue #24): a checkmark list of the
+    /// non-QuickMix stations the user wants included in the mix.
     @Published var showStationSelect = false
     /// Station ids (stableId) currently checked in that sheet.
     @Published var quickMixPicked: Set<String> = []
 
     private var client: PianoClient?
     private var working = false
+    /// Remembers the last station the user played so the app can restore
+    /// and auto-play it on the next launch (issue #4). Injectable so tests
+    /// can point it at a private `UserDefaults` suite.
+    var lastStation: LastStationStore = LastStationStore()
 
     init() {
         playerCancellable = player.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+        }
+        // When a song finishes playing naturally, fetch and start the next
+        // one from the current station (issue #16). The callback fires on
+        // the main thread; the model is main-actor isolated.
+        player.onSongFinished = { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.nextSong()
+            }
         }
         media = MediaSession(model: self)
         // Restore saved credentials and log in automatically, so the user
@@ -159,10 +172,14 @@ final class AppModel: ObservableObject, MediaSessionModel {
         working = true
         isWorking = true
         status = label + "…"
+        let started = status
         Task {
             do {
                 try await work()
-                status = label + " done."
+                // Only apply the default success message when the action
+                // did not set a more specific one itself (e.g. the Explain
+                // button's "We're playing this track because it features …").
+                if status == started { status = label + " done." }
             } catch {
                 status = "Error: \(error.localizedDescription)"
             }
@@ -190,13 +207,28 @@ final class AppModel: ObservableObject, MediaSessionModel {
             var saveStatus = Keychain.save(username: self.username, password: self.password)
             try await client.getStations()
             self.stations = client.stations()
-            if self.selectedStationID == nil, let first = self.stations.first {
+            // Restore the most recently played station (issue #4); fall
+            // back to the first station if there's none saved or it's gone.
+            if let last = self.lastStation.load(),
+               let match = self.stations.first(where: { $0.stableId == last }) {
+                self.selectedStationID = match.stableId
+            } else if self.selectedStationID == nil, let first = self.stations.first {
                 self.selectedStationID = first.stableId
             }
+            // Auto-play a song from the selected station on launch (issue
+            // #4). Covers both "restore the last station and play from it"
+            // and "no station was played before — start from the first".
+            // A failure here must not hide the fact that the login itself
+            // succeeded.
             if saveStatus == errSecSuccess {
                 self.status = "Logged in. \(self.stations.count) station(s)."
             } else {
                 self.status = "Logged in (couldn't remember credentials: OSStatus \(saveStatus)). \(self.stations.count) station(s)."
+            }
+            do {
+                try await self.autoPlayFirstSongIfNeeded()
+            } catch {
+                self.status = "Logged in, but couldn't start music: \(error.localizedDescription)"
             }
         }
     }
@@ -233,6 +265,10 @@ final class AppModel: ObservableObject, MediaSessionModel {
         // username for convenience; clear the password.
         Keychain.delete()
         password = ""
+        // Forget the last-played station too: it belongs to this account,
+        // and the next person to log in shouldn't be auto-started into it
+        // (issue #4).
+        lastStation.save(nil)
         status = "Logged out."
     }
 
@@ -240,10 +276,48 @@ final class AppModel: ObservableObject, MediaSessionModel {
 
     private func playIfAvailable() {
         if let url = currentSong?.audioUrl, let u = URL(string: url) {
+            // A song is starting from this station — remember it as the
+            // most recently played so the app can restore it on launch
+            // (issue #4).
+            if let id = selectedStation?.stableId {
+                lastStation.save(id)
+            }
             player.play(url: u)
             updateNowPlaying()
         } else if currentSong != nil {
             status = "This song has no audio URL."
+        }
+    }
+
+    /// Start (or restart) a song on the currently selected station. Used
+    /// for issue #4's auto-play: on launch, after a station is created, or
+    /// when the user picks a station while paused. Fetches the playlist
+    /// (so there is always a song to play) and starts it.
+    private func autoPlayFirstSongIfNeeded() async throws {
+        guard let station = selectedStation else { return }
+        let songs = try await client?.getPlaylist(station: station) ?? []
+        playlist = songs
+        showUpcoming = false
+        playIfAvailable()
+    }
+
+    /// Called when the user picks a station in the station bar (issue #4).
+    /// Always reflects the choice; and when nothing is playing (paused or
+    /// no song yet), starts a song from the newly selected station. While a
+    /// song is playing we leave it running — switching stations mid-song is
+    /// a deliberate "pause + switch" the user can act on.
+    func stationDidSelect(_ id: String?) {
+        selectedStationID = id
+        guard let id,
+              stations.contains(where: { $0.stableId == id }),
+              player.isPlaying == false
+        else { return }
+        Task { @MainActor in
+            do {
+                try await self.autoPlayFirstSongIfNeeded()
+            } catch {
+                self.status = "Couldn't start music: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -273,12 +347,6 @@ final class AppModel: ObservableObject, MediaSessionModel {
             // audio URL) — fetch the next song from the station and start it.
             nextSong()
         }
-    }
-
-    func stopPlayback() {
-        player.stop()
-        updateNowPlaying()
-        status = "Stopped."
     }
 
     // MARK: Rating
@@ -353,18 +421,6 @@ final class AppModel: ObservableObject, MediaSessionModel {
         }
     }
 
-    func bookmarkSong() {
-        guard let client = client, let song = currentSong else {
-            status = "Play a song first."
-            return
-        }
-        run("Bookmarking") { [weak self] in
-            guard let self else { return }
-            try await client.bookmark(song)
-            self.status = "Bookmarked."
-        }
-    }
-
     func toggleUpcoming() {
         showUpcoming.toggle()
     }
@@ -416,16 +472,21 @@ final class AppModel: ObservableObject, MediaSessionModel {
         stations.filter { !$0.isQuickMix }
     }
 
-    /// Open the "Select stations" sheet (issue #24). Tapping Quick Mix now
-    /// shows a checkmark list instead of blindly toggling everything on/off
-    /// — the old behavior sent an empty mix list to Pandora on the first tap
-    /// (which it rejected with "no error message available") and then always
-    /// skipped to the next song.
+    /// Open the "Select stations" sheet (issue #24). Tapping the button now
+    /// shows a checkmark list instead of blindly toggling everything on/off —
+    /// the old behavior sent an empty mix list to Pandora on the first tap
+    /// (which it rejected with an unmapped error) and then always skipped the
+    /// current song.
     func openStationSelect() {
         quickMixPicked = Set(
             stations.filter { $0.useQuickMix && !$0.isQuickMix }
                 .map { $0.stableId })
         showStationSelect = true
+    }
+
+    /// Toggle a single station in/out of the QuickMix include set (sheet rows).
+    func toggleQuickMixPick(_ stableId: String) {
+        quickMixPicked.toggle(stableId)
     }
 
     /// Apply the checked station set: register it with Pandora, then refresh
@@ -447,7 +508,9 @@ final class AppModel: ObservableObject, MediaSessionModel {
         run("Select stations") { [weak self] in
             guard let self else { return }
             // Mirror the checkmark set onto the C core's useQuickMix flags so
-            // setQuickMix() sends exactly the included non-QuickMix stations.
+            // setQuickMix() sends exactly the included non-QuickMix stations
+            // (operating on the core's authoritative station list, as the old
+            // toggle did — no Swift-held raw pointers).
             for s in self.stations where !s.isQuickMix {
                 s.raw.pointee.useQuickMix = included.contains(s.stableId) ? 1 : 0
             }
@@ -524,6 +587,10 @@ final class AppModel: ObservableObject, MediaSessionModel {
             if let newStation = self.stations.last {
                 self.selectedStationID = newStation.stableId
             }
+            // Start music from the new station — the user just created and
+            // selected it, and nothing is playing yet (issue #4). The play
+            // also records it as the most recently played station.
+            try await self.autoPlayFirstSongIfNeeded()
             self.searchResult = nil
             self.status = "Station \"\(name)\" created."
         }
@@ -558,6 +625,10 @@ private struct Control: Identifiable {
     let systemImage: String
     let role: Role
     let enabled: Bool
+    /// When true, the tile renders the stock iOS output picker inline
+    /// (speaker / headphones / Bluetooth / AirPlay) instead of an SF Symbol,
+    /// and the picker button itself owns the tap.
+    var isDevicePicker: Bool = false
     let action: () -> Void
 }
 
@@ -669,8 +740,8 @@ struct ContentView: View {
         .sheet(isPresented: $model.showAddSearch) {
             AddMusicSheet(model: model)
         }
-        .sheet(isPresented: $model.showDevicePicker) {
-            DevicePickerSheet()
+        .sheet(isPresented: $model.showHelp) {
+            HelpSheet()
         }
         .sheet(isPresented: $model.showStationSelect) {
             StationSelectSheet(model: model)
@@ -693,7 +764,10 @@ struct ContentView: View {
 
     private var stationBar: some View {
         HStack {
-            Picker("Station", selection: $model.selectedStationID) {
+            Picker("Station", selection: Binding(
+            get: { model.selectedStationID },
+            set: { model.stationDidSelect($0) }
+        )) {
                 Text("—").tag(String?.none)
                 ForEach(model.stations) { s in
                     Text(s.name ?? s.stableId).tag(Optional(s.stableId))
@@ -736,9 +810,6 @@ struct ContentView: View {
                   action: model.togglePlayback),
             .init(id: "next", title: "Next", systemImage: "forward.fill",
                   role: .normal, enabled: hasStation, action: model.nextSong),
-            .init(id: "stop", title: "Stop", systemImage: "stop.fill",
-                  role: .normal, enabled: model.player.isPlaying,
-                  action: model.stopPlayback),
             .init(id: "upcoming", title: "Upcoming", systemImage: "list.bullet",
                   role: .normal, enabled: hasUpcoming,
                   action: model.toggleUpcoming),
@@ -755,8 +826,6 @@ struct ContentView: View {
                   action: model.markTired),
             .init(id: "explain", title: "Explain", systemImage: "questionmark.circle",
                   role: .normal, enabled: hasSong, action: model.explainSong),
-            .init(id: "bookmark", title: "Bookmark", systemImage: "bookmark.fill",
-                  role: .normal, enabled: hasSong, action: model.bookmarkSong),
             .init(id: "addseed", title: "Add Music", systemImage: "plus.circle",
                   role: .normal, enabled: hasStation,
                   action: { model.showAddSearch = true }),
@@ -766,31 +835,62 @@ struct ContentView: View {
                   role: .normal, enabled: hasStation,
                   action: { model.confirmDelete = true }),
             .init(id: "quickmix", title: "Select Stations", systemImage: "shuffle",
-                  role: .normal, enabled: hasStation, action: model.openStationSelect),
+                  role: .normal,
+                  enabled: hasStation && model.selectedStation?.isQuickMix == true,
+                  action: model.openStationSelect),
             .init(id: "device", title: "Device", systemImage: "hifispeaker",
-                  role: .normal, enabled: true,
-                  action: { model.showDevicePicker = true }),
+                  role: .normal, enabled: true, isDevicePicker: true,
+                  action: {}),
             .init(id: "save", title: "Save", systemImage: "square.and.arrow.down",
                   role: .normal,
                   enabled: hasSong && model.currentSong?.audioUrl != nil,
                   action: model.saveSong),
+            .init(id: "help", title: "Help", systemImage: "questionmark.circle",
+                  role: .normal, enabled: true,
+                  action: { model.showHelp = true }),
         ]
 
         return LazyVGrid(columns: columns, spacing: 10) {
             ForEach(controls) { c in
-                Button(action: c.action) {
+                if c.isDevicePicker {
+                    // Native iOS output picker, inline on the main screen.
+                    // No SwiftUI Button wrapper — that would swallow the tap.
+                    // A VStack is a plain layout container, so the embedded
+                    // route button (speaker icon) keeps its own hit-testing
+                    // and opens the system sheet (speaker / headphones /
+                    // Bluetooth / AirPlay) when tapped.
                     VStack(spacing: 6) {
-                        Image(systemName: c.systemImage)
-                            .font(.system(size: 20, weight: .semibold))
+                        DevicePickerButton()
+                            .frame(width: 30, height: 30)
                         Text(c.title)
                             .font(.subheadline.weight(.medium))
                             .lineLimit(1)
                             .minimumScaleFactor(0.8)
                     }
                     .frame(maxWidth: .infinity, minHeight: 62)
+                    .background(Color(.secondarySystemBackground),
+                                in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color(.separator).opacity(0.4),
+                                          lineWidth: 1)
+                    )
+                    .disabled(model.isWorking)
+                } else {
+                    Button(action: c.action) {
+                        VStack(spacing: 6) {
+                            Image(systemName: c.systemImage)
+                                .font(.system(size: 20, weight: .semibold))
+                            Text(c.title)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 62)
+                    }
+                    .buttonStyle(GridButtonStyle(role: c.role))
+                    .disabled(!c.enabled || model.isWorking)
                 }
-                .buttonStyle(GridButtonStyle(role: c.role))
-                .disabled(!c.enabled || model.isWorking)
             }
         }
     }
@@ -914,71 +1014,6 @@ struct AddMusicSheet: View {
     }
 }
 
-// MARK: - Select stations sheet (QuickMix include list, issue #24)
-
-/// Checkmark list of the stations to include in the current QuickMix station,
-/// with a Done button. Presented by the "Select Stations" button. Replaces the
-/// old blind all-on/all-off QuickMix toggle (which sent an empty mix list to
-/// Pandora on the first tap and always skipped the current song).
-struct StationSelectSheet: View {
-    @ObservedObject var model: AppModel
-    @Environment(\.dismiss) private var dismiss
-
-    private var list: [Station] { model.stationSelectList }
-
-    var body: some View {
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Choose which stations to include in this mix.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                if list.isEmpty {
-                    Text("There are no other stations to include.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(list) { s in
-                        Button {
-                            if model.quickMixPicked.contains(s.stableId) {
-                                model.quickMixPicked.remove(s.stableId)
-                            } else {
-                                model.quickMixPicked.insert(s.stableId)
-                            }
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName:
-                                    model.quickMixPicked.contains(s.stableId)
-                                    ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(
-                                        model.quickMixPicked.contains(s.stableId)
-                                        ? Color.accentColor : Color.secondary)
-                                Text(s.name ?? s.stableId)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                }
-                Spacer()
-            }
-            .padding()
-            .navigationTitle("Select Stations")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { model.applyStationSelect() }
-                        .disabled(model.quickMixPicked.isEmpty || model.isWorking)
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-    }
-}
-
 // MARK: - Button styling
 
 private struct GridButtonStyle: ButtonStyle {
@@ -1028,6 +1063,164 @@ private struct GridButtonStyle: ButtonStyle {
     ContentView()
 }
 
+// MARK: - Select stations sheet (QuickMix include list, issue #24)
+
+/// Checkmark list of the stations to blend into a QuickMix. Tapping a row
+/// toggles it in/out of the include set; "Apply" sends the selection to the
+/// QuickMix station and, if the currently playing song is from a station that
+/// is no longer included, skips to a new song (issue #24).
+struct StationSelectSheet: View {
+    @ObservedObject var model: PianoAppModel
+
+    /// Rows are the non-QuickMix stations (the sources to blend); the
+    /// currently-selected QuickMix station is excluded by the model's
+    /// `stationSelectList`.
+    private var rows: [StationPickRow] {
+        model.stationSelectList.map { s in
+            StationPickRow(station: s,
+                           picked: model.quickMixPicked.contains(s.stableId))
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(rows) { row in
+                        Button {
+                            model.toggleQuickMixPick(row.station.stableId)
+                        } label: {
+                            HStack {
+                                Text(row.station.name ?? "(unnamed)")
+                                    .lineLimit(1)
+                                Spacer()
+                                if row.picked {
+                                    Image(systemName: "checkmark")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                        .foregroundStyle(.primary)
+                    }
+                } header: {
+                    Text("Stations to blend into QuickMix")
+                } footer: {
+                    Text("Songs only play from checked stations. Unchecked stations are excluded from the mix.")
+                }
+
+                Section {
+                    Button {
+                        model.applyStationSelect()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Text("Apply")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .disabled(model.quickMixPicked.isEmpty)
+                }
+            }
+            .navigationTitle("Select Stations")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.showStationSelect = false }
+                }
+            }
+        }
+    }
+}
+
+/// One row in the "Select Stations" list.
+private struct StationPickRow: Identifiable {
+    let station: Station
+    let picked: Bool
+    var id: String { station.stableId }
+}
+
+// MARK: - Help sheet (what each button does)
+
+/// One row in the help sheet: icon, name, one-sentence explanation.
+private struct HelpEntry: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+    let detail: String
+}
+
+/// Large sheet opened from the Help button. Lists every other button in the
+/// app (grid + toolbar), each with a one-sentence explanation.
+struct HelpSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let entries: [HelpEntry] = [
+        HelpEntry(id: "playpause", title: "Play / Pause", systemImage: "play.fill",
+                  detail: "Starts or pauses the current song; if nothing is queued it fetches the next song from your station first."),
+        HelpEntry(id: "next", title: "Next", systemImage: "forward.fill",
+                  detail: "Skips ahead and starts the next song from the selected station."),
+        HelpEntry(id: "stop", title: "Stop", systemImage: "stop.fill",
+                  detail: "Stops playback and clears the queue."),
+        HelpEntry(id: "upcoming", title: "Upcoming", systemImage: "list.bullet",
+                  detail: "Toggles the list of the next few songs in the queue."),
+        HelpEntry(id: "love", title: "Love", systemImage: "heart.fill",
+                  detail: "Tells Pandora you love this song so you'll hear more like it; tap again on the same song to clear the heart."),
+        HelpEntry(id: "ban", title: "Ban", systemImage: "nosign",
+                  detail: "Tells Pandora to stop playing this song and then moves on to the next one."),
+        HelpEntry(id: "tired", title: "Tired", systemImage: "zzz",
+                  detail: "Tells Pandora you've heard this one too many times and then moves on to the next song."),
+        HelpEntry(id: "explain", title: "Explain", systemImage: "questionmark.circle",
+                  detail: "Shows Pandora's reason for playing this song (which seed it came from)."),
+        HelpEntry(id: "addseed", title: "Add Music", systemImage: "plus.circle",
+                  detail: "Opens a search where you can add an artist or song to the current station as a seed."),
+        HelpEntry(id: "rename", title: "Rename", systemImage: "pencil",
+                  detail: "Renames the currently selected station."),
+        HelpEntry(id: "delete", title: "Delete", systemImage: "trash",
+                  detail: "Deletes the currently selected station from your account."),
+        HelpEntry(id: "quickmix", title: "Select Stations", systemImage: "shuffle",
+                  detail: "On a QuickMix station, choose which of your stations to blend into the mix (checkmark list). Only skips to a new song if the current song is from an excluded station."),
+        HelpEntry(id: "device", title: "Device", systemImage: "hifispeaker",
+                  detail: "Opens the system picker to choose where audio plays (speaker, headphones, Bluetooth, AirPlay)."),
+        HelpEntry(id: "save", title: "Save", systemImage: "square.and.arrow.down",
+                  detail: "Downloads the current song as an .m4a and lets you save it to Music or Files."),
+        HelpEntry(id: "refresh", title: "Refresh", systemImage: "arrow.clockwise",
+                  detail: "Re-loads your station list from your Pandora account (top-right toolbar)."),
+        HelpEntry(id: "logout", title: "Log out", systemImage: "rectangle.portrait.and.arrow.right",
+                  detail: "Ends the session and returns you to the login screen (top-right toolbar)."),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List(entries) { e in
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: e.systemImage)
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 26)
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(e.title)
+                            .font(.subheadline.weight(.semibold))
+                        Text(e.detail)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .navigationTitle("What each button does")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+    }
+}
+
 // MARK: - Device picker (stock iOS output picker)
 
 /// A saved song file, Identifiable for `.sheet(item:)`.
@@ -1036,9 +1229,10 @@ struct ShareItem: Identifiable {
     var id: String { url.absoluteString }
 }
 
-/// A button showing the stock iOS route button (speaker icon). Tapping
-/// it opens the system output picker (speaker / headphones / Bluetooth /
-/// AirPlay) — the same picker the volume HUD shows in other apps.
+/// A stock iOS route button (speaker icon). Tapping it opens the system
+/// output picker (speaker / headphones / Bluetooth / AirPlay) — the same
+/// picker the volume HUD shows in other apps. Rendered inline in the
+/// Device tile on the main screen (no popup sheet).
 struct DevicePickerButton: UIViewRepresentable {
     func makeUIView(context: Context) -> MPVolumeView {
         let v = MPVolumeView()
@@ -1049,30 +1243,6 @@ struct DevicePickerButton: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MPVolumeView, context: Context) {}
-}
-
-/// Sheet with the stock output picker (the system AirPlay/output button
-/// from `MPVolumeView` — tapping it opens the stock picker listing
-/// speaker, headphones, Bluetooth, and AirPlay targets).
-struct DevicePickerSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Play through…")
-                .font(.headline)
-            DevicePickerButton()
-                .frame(width: 64, height: 64)
-            Text("Tap the speaker button to open the system picker\n(speaker, headphones, Bluetooth, AirPlay).")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Spacer()
-            Button("Done") { dismiss() }
-                .buttonStyle(.bordered)
-        }
-        .padding(24)
-    }
 }
 
 // MARK: - Share sheet (saved song → Music / Files / …)
